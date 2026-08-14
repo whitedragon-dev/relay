@@ -1,0 +1,345 @@
+// ============================================================
+// WIKIPEDIA PROXY - Debugged Version
+// ============================================================
+
+const CACHE_TTL = 86400;
+const ALLOWED_DOMAINS = [
+  'wikipedia.org',
+  'wikimedia.org',
+  'mediawiki.org',
+  'wikidata.org'
+];
+
+function getBaseUrl(request) {
+  const url = new URL(request.url);
+  return `${url.protocol}//${url.host}`;
+}
+
+function rewriteUrl(href, baseUrl, currentPageUrl) {
+  if (!href) return href;
+  
+  href = href.trim();
+  
+  // Skip protocols that shouldn't be proxied
+  if (!href || 
+      href.startsWith('javascript:') || 
+      href.startsWith('mailto:') || 
+      href.startsWith('tel:') || 
+      href.startsWith('data:') ||
+      href.startsWith('#')) {
+    return href;
+  }
+
+  // Parse the URL
+  let urlObj;
+  try {
+    if (href.startsWith('//')) {
+      urlObj = new URL('https:' + href);
+    } else if (href.startsWith('/')) {
+      urlObj = new URL(href, currentPageUrl);
+    } else if (!href.includes('://')) {
+      urlObj = new URL(href, currentPageUrl);
+    } else {
+      urlObj = new URL(href);
+    }
+  } catch {
+    return href;
+  }
+
+  // Check if it's a Wikipedia/Wikimedia domain
+  const isAllowed = ALLOWED_DOMAINS.some(domain => 
+    urlObj.hostname === domain || urlObj.hostname.endsWith('.' + domain)
+  );
+
+  if (!isAllowed) {
+    return href;
+  }
+
+  // Return proxied URL
+  return `${baseUrl}?url=${encodeURIComponent(urlObj.href)}`;
+}
+
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const baseUrl = getBaseUrl(request);
+  const targetUrl = url.searchParams.get('url');
+
+  // --- UI for root path ---
+  if (!targetUrl) {
+    return new Response(
+      `<!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Wikipedia Proxy</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f0f2f5;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+          }
+          .container {
+            background: white;
+            border-radius: 16px;
+            padding: 48px 40px;
+            max-width: 520px;
+            width: 100%;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.08);
+            text-align: center;
+          }
+          h1 {
+            font-size: 28px;
+            font-weight: 600;
+            color: #1a1a2e;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+          }
+          .subtitle {
+            color: #6b7280;
+            font-size: 15px;
+            margin-bottom: 32px;
+            line-height: 1.5;
+          }
+          .input-group {
+            display: flex;
+            gap: 10px;
+            background: #f8f9fc;
+            border-radius: 12px;
+            padding: 4px;
+            border: 1px solid #e5e7eb;
+            transition: border 0.2s;
+          }
+          .input-group:focus-within {
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
+          }
+          input {
+            flex: 1;
+            border: none;
+            background: transparent;
+            padding: 14px 18px;
+            font-size: 15px;
+            outline: none;
+            color: #1a1a2e;
+            font-family: inherit;
+          }
+          input::placeholder {
+            color: #9ca3af;
+          }
+          button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+            font-family: inherit;
+          }
+          button:hover {
+            background: #2563eb;
+          }
+          .example {
+            margin-top: 20px;
+            font-size: 13px;
+            color: #9ca3af;
+          }
+          .example a {
+            color: #3b82f6;
+            text-decoration: none;
+            font-weight: 500;
+          }
+          .example a:hover {
+            text-decoration: underline;
+          }
+          .footer {
+            margin-top: 28px;
+            font-size: 12px;
+            color: #d1d5db;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>Wikipedia Proxy</h1>
+          <p class="subtitle">Access Wikipedia articles seamlessly</p>
+          <form id="form">
+            <div class="input-group">
+              <input type="text" id="input" placeholder="e.g. /wiki/Main_Page" />
+              <button type="submit">Go</button>
+            </div>
+          </form>
+          <div class="example">
+            Try: <a href="?url=https://en.wikipedia.org/wiki/Main_Page">Main Page</a>
+            &middot; <a href="?url=https://zh.wikipedia.org/wiki/%E4%B8%AD%E6%96%87">中文</a>
+          </div>
+          <div class="footer">Cloudflare Worker &bull; Wikipedia Proxy</div>
+        </div>
+        <script>
+          document.getElementById('form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const val = document.getElementById('input').value.trim();
+            if (!val) return;
+            let url = val;
+            if (url.startsWith('/')) {
+              url = 'https://en.wikipedia.org' + url;
+            } else if (!url.startsWith('http')) {
+              url = 'https://en.wikipedia.org/wiki/' + encodeURIComponent(val);
+            }
+            window.location.href = '?url=' + encodeURIComponent(url);
+          });
+        </script>
+      </body>
+      </html>`,
+      { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+    );
+  }
+
+  // --- Validate target URL ---
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(targetUrl);
+  } catch {
+    return new Response('Invalid URL', { status: 400 });
+  }
+
+  const isAllowed = ALLOWED_DOMAINS.some(domain =>
+    upstreamUrl.hostname === domain || upstreamUrl.hostname.endsWith('.' + domain)
+  );
+  if (!isAllowed) {
+    return new Response('Only Wikipedia domains are allowed', { status: 403 });
+  }
+
+  // --- Fetch from upstream ---
+  const fetchOptions = {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': 'https://www.wikipedia.org/',
+      'Cache-Control': 'no-cache'
+    },
+    redirect: 'follow'
+  };
+
+  let response;
+  try {
+    response = await fetch(targetUrl, fetchOptions);
+  } catch (err) {
+    return new Response('Failed to fetch: ' + err.message, { status: 502 });
+  }
+
+  const contentType = response.headers.get('Content-Type') || '';
+
+  // --- Handle non-HTML content ---
+  if (!contentType.includes('text/html')) {
+    // Create new response to avoid locked body issues
+    const body = await response.arrayBuffer();
+    const cachedResponse = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers
+    });
+    cachedResponse.headers.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
+    // Remove problematic headers
+    cachedResponse.headers.delete('Content-Encoding');
+    cachedResponse.headers.delete('Content-Length');
+    return cachedResponse;
+  }
+
+  // --- HTML REWRITING ---
+  let html;
+  try {
+    html = await response.text();
+  } catch {
+    return new Response('Failed to read response', { status: 500 });
+  }
+
+  const currentPageUrl = targetUrl;
+
+  // IMPORTANT: Use a more robust replacement that handles both single and double quotes
+  // First pass: href="..." and src="..."
+  html = html.replace(/(href|src)\s*=\s*"([^"]*)"/g, (match, attr, link) => {
+    const rewritten = rewriteUrl(link, baseUrl, currentPageUrl);
+    return `${attr}="${rewritten}"`;
+  });
+
+  // Second pass: href='...' and src='...'
+  html = html.replace(/(href|src)\s*=\s*'([^']*)'/g, (match, attr, link) => {
+    const rewritten = rewriteUrl(link, baseUrl, currentPageUrl);
+    return `${attr}='${rewritten}'`;
+  });
+
+  // Third pass: srcset
+  html = html.replace(/srcset\s*=\s*"([^"]*)"/g, (match, srcset) => {
+    const parts = srcset.split(',').map(part => {
+      const trimmed = part.trim();
+      const spaceIndex = trimmed.lastIndexOf(' ');
+      const urlPart = spaceIndex > 0 ? trimmed.substring(0, spaceIndex) : trimmed;
+      const descriptor = spaceIndex > 0 ? trimmed.substring(spaceIndex) : '';
+      const rewrittenUrl = rewriteUrl(urlPart, baseUrl, currentPageUrl);
+      return rewrittenUrl + descriptor;
+    });
+    return `srcset="${parts.join(', ')}"`;
+  });
+
+  // Fourth pass: srcset='...'
+  html = html.replace(/srcset\s*=\s*'([^']*)'/g, (match, srcset) => {
+    const parts = srcset.split(',').map(part => {
+      const trimmed = part.trim();
+      const spaceIndex = trimmed.lastIndexOf(' ');
+      const urlPart = spaceIndex > 0 ? trimmed.substring(0, spaceIndex) : trimmed;
+      const descriptor = spaceIndex > 0 ? trimmed.substring(spaceIndex) : '';
+      const rewrittenUrl = rewriteUrl(urlPart, baseUrl, currentPageUrl);
+      return rewrittenUrl + descriptor;
+    });
+    return `srcset='${parts.join(', ')}'`;
+  });
+
+  // Fifth pass: form actions
+  html = html.replace(/<form[^>]*action\s*=\s*"([^"]*)"/g, (match, action) => {
+    const rewritten = rewriteUrl(action, baseUrl, currentPageUrl);
+    return match.replace(action, rewritten);
+  });
+  
+  html = html.replace(/<form[^>]*action\s*=\s*'([^']*)'/g, (match, action) => {
+    const rewritten = rewriteUrl(action, baseUrl, currentPageUrl);
+    return match.replace(action, rewritten);
+  });
+
+  // Remove security headers that break proxying
+  html = html.replace(/<meta[^>]*Content-Security-Policy[^>]*>/gi, '');
+  html = html.replace(/<meta[^>]*X-Frame-Options[^>]*>/gi, '');
+  html = html.replace(/<meta[^>]*referrer[^>]*>/gi, '');
+
+  // Fix protocol-relative URLs that might have been missed
+  html = html.replace(/(href|src)=["']\/\//g, `$1="${baseUrl}?url=https://`);
+
+  // --- Return rewritten HTML ---
+  const proxyResponse = new Response(html, {
+    status: response.status,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'public, max-age=300',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'SAMEORIGIN'
+    }
+  });
+
+  return proxyResponse;
+}
+
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
