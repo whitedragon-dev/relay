@@ -240,6 +240,7 @@ class ScriptInjector {
     (function() {
       var PROXY_PREFIX = '${this.proxyOrigin}${PROXY_PATH_PREFIX}';
       var REAL_ORIGIN = '${this.realOrigin}';
+      console.log('[proxy-debug] script loaded, PROXY_PREFIX=', PROXY_PREFIX, 'REAL_ORIGIN=', REAL_ORIGIN);
 
       function wrapReal(u) {
         if (u.protocol !== 'http:' && u.protocol !== 'https:') return u.href;
@@ -253,6 +254,7 @@ class ScriptInjector {
       function toProxied(url) {
         try {
           if (typeof url !== 'string') return url;
+          console.log('[proxy-debug] toProxied called with:', url);
           if (/^(data|blob|javascript):/i.test(url)) return url;
           if (url.indexOf(PROXY_PREFIX) === 0) return url; // already proxied
 
@@ -312,29 +314,42 @@ class ScriptInjector {
         var origAssign = LocProto.assign;
         var origReplace = LocProto.replace;
         var hrefDesc = Object.getOwnPropertyDescriptor(LocProto, 'href');
+        console.log('[proxy-debug] location.href descriptor configurable:', hrefDesc && hrefDesc.configurable);
 
         LocProto.assign = function(url) {
+          console.log('[proxy-debug] location.assign called with:', url);
           return origAssign.call(this, toProxied(url));
         };
         LocProto.replace = function(url) {
+          console.log('[proxy-debug] location.replace called with:', url);
           return origReplace.call(this, toProxied(url));
         };
         if (hrefDesc && hrefDesc.configurable && hrefDesc.set) {
           Object.defineProperty(LocProto, 'href', {
             get: hrefDesc.get,
-            set: function(url) { hrefDesc.set.call(this, toProxied(url)); },
+            set: function(url) {
+              console.log('[proxy-debug] location.href = ', url);
+              hrefDesc.set.call(this, toProxied(url));
+            },
             configurable: true,
             enumerable: hrefDesc.enumerable
           });
+        } else {
+          console.warn('[proxy-debug] could NOT patch location.href - not configurable!');
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[proxy-debug] location patch threw:', e);
+      }
 
       // SPA-style client-side navigation (Turbo, React Router, etc.) that
       // updates the URL bar via the History API without a real page load.
       ['pushState', 'replaceState'].forEach(function(method) {
         var orig = history[method];
         history[method] = function(state, title, url) {
-          if (url) { try { url = toProxied(url); } catch (e) {} }
+          if (url) {
+            console.log('[proxy-debug] history.' + method + ' called with:', url);
+            try { url = toProxied(url); } catch (e) {}
+          }
           return orig.call(this, state, title, url);
         };
       });
@@ -349,6 +364,34 @@ class ScriptInjector {
         e.preventDefault();
         window.location.href = toProxied(raw);
       }, true);
+
+      // Forms created/updated by page JS (e.g. a search widget) also never
+      // pass through the server-side rewriter, so their action attribute can
+      // be a raw root-relative path. Fix it up right before submission.
+      // Note: form.submit() does NOT fire a 'submit' event at all (a
+      // spec-defined quirk), so both paths need separate handling.
+      function fixFormAction(form) {
+        try {
+          var raw = form.getAttribute('action');
+          console.log('[proxy-debug] fixFormAction, raw action=', raw);
+          if (raw) {
+            var fixed = toProxied(raw);
+            if (fixed && fixed !== raw) form.setAttribute('action', fixed);
+          }
+        } catch (e) {}
+      }
+
+      document.addEventListener('submit', function(e) {
+        console.log('[proxy-debug] submit event on:', e.target);
+        if (e.target && e.target.tagName === 'FORM') fixFormAction(e.target);
+      }, true);
+
+      var origFormSubmit = HTMLFormElement.prototype.submit;
+      HTMLFormElement.prototype.submit = function() {
+        console.log('[proxy-debug] form.submit() called on:', this);
+        fixFormAction(this);
+        return origFormSubmit.call(this);
+      };
     })();
     </script>
   `,
