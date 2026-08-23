@@ -302,6 +302,43 @@ class ScriptInjector {
         return origOpen.apply(this, arguments);
       };
 
+      // Programmatic navigation (location.href = ..., location.assign(...),
+      // location.replace(...)) bypasses both the click listener and the
+      // fetch/XHR patch entirely. Window.prototype.location itself can't be
+      // redefined (browsers throw), but Location.prototype's own members
+      // are configurable, so patch those instead.
+      try {
+        var LocProto = Object.getPrototypeOf(window.location);
+        var origAssign = LocProto.assign;
+        var origReplace = LocProto.replace;
+        var hrefDesc = Object.getOwnPropertyDescriptor(LocProto, 'href');
+
+        LocProto.assign = function(url) {
+          return origAssign.call(this, toProxied(url));
+        };
+        LocProto.replace = function(url) {
+          return origReplace.call(this, toProxied(url));
+        };
+        if (hrefDesc && hrefDesc.configurable && hrefDesc.set) {
+          Object.defineProperty(LocProto, 'href', {
+            get: hrefDesc.get,
+            set: function(url) { hrefDesc.set.call(this, toProxied(url)); },
+            configurable: true,
+            enumerable: hrefDesc.enumerable
+          });
+        }
+      } catch (e) {}
+
+      // SPA-style client-side navigation (Turbo, React Router, etc.) that
+      // updates the URL bar via the History API without a real page load.
+      ['pushState', 'replaceState'].forEach(function(method) {
+        var orig = history[method];
+        history[method] = function(state, title, url) {
+          if (url) { try { url = toProxied(url); } catch (e) {} }
+          return orig.call(this, state, title, url);
+        };
+      });
+
       // Safety net for anchors created/modified by page JS after load
       // (never seen by the server-side rewriter).
       document.addEventListener('click', function(e) {
