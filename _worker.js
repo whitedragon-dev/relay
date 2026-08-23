@@ -164,11 +164,55 @@ class ScriptInjector {
     this.proxyOrigin = proxyOrigin;
   }
   element(el) {
-    el.append(
+    el.prepend(
       `
     <script>
     (function() {
       var proxyBase = '${this.proxyOrigin}/?url=';
+
+      function toProxied(url) {
+        try {
+          if (typeof url !== 'string') return url;
+          if (url.indexOf('/?url=') !== -1) return url; // already proxied
+          if (/^(data|blob|javascript):/i.test(url)) return url;
+          var abs = new URL(url, document.baseURI).href;
+          return proxyBase + encodeURIComponent(abs);
+        } catch (e) {
+          return url;
+        }
+      }
+
+      // Page JS (Turbo navigation, search suggestions, settings menus, etc.)
+      // calls fetch()/XHR with relative/root-relative URLs. Those resolve
+      // correctly against the <base> tag, but the browser then tries to hit
+      // the real site directly and gets blocked by CORS. Route them through
+      // the proxy instead - same-origin from the browser's perspective.
+      var origFetch = window.fetch;
+      window.fetch = function(input, init) {
+        try {
+          if (typeof input === 'string') {
+            input = toProxied(input);
+          } else if (input && input.url) {
+            input = new Request(toProxied(input.url), {
+              method: input.method,
+              headers: input.headers,
+              body: ['GET', 'HEAD'].includes(input.method) ? undefined : input.body,
+              credentials: input.credentials,
+              redirect: input.redirect
+            });
+          }
+        } catch (e) {}
+        return origFetch.call(this, input, init);
+      };
+
+      var origOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        try {
+          arguments[1] = toProxied(url);
+        } catch (e) {}
+        return origOpen.apply(this, arguments);
+      };
+
       document.addEventListener('click', function(e) {
         var link = e.target.closest('a');
         if (!link || !link.href) return;
