@@ -19,6 +19,40 @@
 
 const PROXY_PATH_PREFIX = '/p/';
 
+// Service Worker: the actual root fix. Instead of trying to patch every
+// possible JS API that could initiate a request (fetch, XHR, location,
+// pushState, form submit...) - which is inherently incomplete, since any
+// library that cached an original function reference before our page
+// script ran bypasses those patches - this intercepts at the network layer.
+// Every outgoing request from the page passes through here regardless of
+// what triggered it. If a request's path is missing our /p/... prefix
+// (leaked to a bare root-relative URL by whatever mechanism), we recover
+// the real origin from the request's referrer - which, for any page this
+// proxy serves, is itself a /p/<protocol>/<host>/... URL - and redirect to
+// the corrected proxied URL before the bad request ever goes out.
+const SERVICE_WORKER_SCRIPT = `
+const PROXY_PATH_PREFIX = '/p/';
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  const url = new URL(req.url);
+
+  if (url.origin !== self.location.origin) return; // not our proxy, ignore
+  if (url.pathname === '/' || url.pathname === '/sw.js') return;
+  if (url.pathname.indexOf(PROXY_PATH_PREFIX) === 0) return; // already correct
+
+  const match = (req.referrer || '').match(/\\/p\\/(https?)\\/([^/]+)/);
+  if (!match) return; // can't recover real origin, let it pass through
+
+  const [, protocol, host] = match;
+  const fixed = url.origin + PROXY_PATH_PREFIX + protocol + '/' + host + url.pathname + url.search + url.hash;
+  event.respondWith(Response.redirect(fixed, 302));
+});
+`;
+
 const USAGE_PAGE = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Proxy</title></head>
 <body style="font-family:sans-serif;max-width:480px;margin:60px auto">
@@ -43,6 +77,12 @@ function go() {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/sw.js') {
+      return new Response(SERVICE_WORKER_SCRIPT, {
+        headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
+      });
+    }
 
     // Backward-compat: redirect old ?url=... bookmarks/links to the new path scheme.
     if (url.pathname === '/' && url.searchParams.has('url')) {
@@ -242,6 +282,14 @@ class ScriptInjector {
       var REAL_ORIGIN = '${this.realOrigin}';
       console.log('[proxy-debug] script loaded, PROXY_PREFIX=', PROXY_PREFIX, 'REAL_ORIGIN=', REAL_ORIGIN);
 
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function() {
+          console.log('[proxy-debug] service worker registered');
+        }).catch(function(e) {
+          console.warn('[proxy-debug] service worker registration failed:', e);
+        });
+      }
+
       function wrapReal(u) {
         if (u.protocol !== 'http:' && u.protocol !== 'https:') return u.href;
         return PROXY_PREFIX + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
@@ -354,10 +402,22 @@ class ScriptInjector {
         };
       });
 
+      // e.target gets retargeted to the shadow host for elements inside a
+      // shadow root (e.g. custom-element widgets like GitHub's search box),
+      // so e.target.tagName / .closest() silently miss the real element.
+      // composedPath() gives the true originating element regardless.
+      function firstInPath(e, selector) {
+        var path = e.composedPath ? e.composedPath() : [e.target];
+        for (var i = 0; i < path.length; i++) {
+          if (path[i] && path[i].matches && path[i].matches(selector)) return path[i];
+        }
+        return null;
+      }
+
       // Safety net for anchors created/modified by page JS after load
       // (never seen by the server-side rewriter).
       document.addEventListener('click', function(e) {
-        var link = e.target.closest('a');
+        var link = firstInPath(e, 'a');
         if (!link) return;
         var raw = link.getAttribute('href');
         if (!raw || /^(javascript|data|blob|#)/i.test(raw)) return;
@@ -382,8 +442,9 @@ class ScriptInjector {
       }
 
       document.addEventListener('submit', function(e) {
-        console.log('[proxy-debug] submit event on:', e.target);
-        if (e.target && e.target.tagName === 'FORM') fixFormAction(e.target);
+        var form = firstInPath(e, 'form') || (e.target && e.target.tagName === 'FORM' ? e.target : null);
+        console.log('[proxy-debug] submit event, resolved form:', form);
+        if (form) fixFormAction(form);
       }, true);
 
       var origFormSubmit = HTMLFormElement.prototype.submit;
@@ -392,6 +453,24 @@ class ScriptInjector {
         fixFormAction(this);
         return origFormSubmit.call(this);
       };
+
+      // Final safety net: every patch above tries to prevent a bad
+      // navigation before it happens, but any of them can be silently
+      // bypassed (e.g. a library that captured the original history
+      // .pushState/fetch reference before this script ran). This instead
+      // checks the OUTCOME - if we ever land on a URL missing the /p/...
+      // prefix, reconstruct and correct it immediately, regardless of what
+      // caused it.
+      function checkAndFixLocation() {
+        var path = window.location.pathname;
+        if (path === '/' || path.indexOf('${PROXY_PATH_PREFIX}') === 0) return;
+        var real = new URL(REAL_ORIGIN);
+        var fixed = PROXY_PREFIX + real.protocol.slice(0, -1) + '/' + real.host + path + window.location.search + window.location.hash;
+        console.warn('[proxy-debug] caught un-proxied navigation, correcting:', path, '->', fixed);
+        window.location.replace(fixed);
+      }
+      checkAndFixLocation();
+      window.addEventListener('popstate', checkAndFixLocation);
     })();
     </script>
   `,
