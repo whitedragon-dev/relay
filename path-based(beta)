@@ -1,0 +1,321 @@
+// Cloudflare Workers forwarding proxy — PATH-BASED scheme
+//
+// URL format:  https://<worker>/p/<protocol>/<host>/<path>?<query>
+//   e.g.        https://<worker>/p/https/github.com/search?q=hi
+//
+// Why path-based instead of query-param (?url=...):
+// Browsers and JS module loaders (ES module `import`, webpack publicPath,
+// etc.) resolve relative resources against the *path* of the requesting
+// document/script — never against a query string. Putting the real
+// protocol/host/path in our own path means that resolution stays correct
+// automatically. A chunk loaded from
+//   /p/https/github.githubassets.com/assets/foo.js
+// doing `import './bar.js'` naturally resolves to
+//   /p/https/github.githubassets.com/assets/bar.js
+// which is exactly what we want. Under a query-param scheme this was
+// impossible, because the real URL was hidden inside an opaque value with
+// no directory structure to resolve against — this is what broke GitHub's
+// search/settings widgets (their JS chunks failed to load).
+
+const PROXY_PATH_PREFIX = '/p/';
+
+const USAGE_PAGE = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Proxy</title></head>
+<body style="font-family:sans-serif;max-width:480px;margin:60px auto">
+<h1>Proxy</h1>
+<form onsubmit="event.preventDefault(); go();">
+  <input id="u" type="url" placeholder="https://example.com" style="width:100%;padding:8px" required>
+  <button type="submit" style="margin-top:8px;padding:8px 16px">Go</button>
+</form>
+<script>
+function go() {
+  var v = document.getElementById('u').value;
+  try {
+    var u = new URL(v);
+    location.href = '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+  } catch (e) {
+    alert('Invalid URL');
+  }
+}
+</script>
+</body></html>`;
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Backward-compat: redirect old ?url=... bookmarks/links to the new path scheme.
+    if (url.pathname === '/' && url.searchParams.has('url')) {
+      try {
+        const legacy = new URL(url.searchParams.get('url'));
+        return Response.redirect(url.origin + wrapReal(legacy, url.origin), 301);
+      } catch {
+        // fall through to usage page
+      }
+    }
+
+    if (url.pathname === '/') {
+      return new Response(USAGE_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
+    const match = url.pathname.match(/^\/p\/(https?)\/([^/]+)(\/[^?]*)?$/);
+    if (!match) {
+      return new Response('Not found. Usage: /p/https/example.com/path', { status: 404 });
+    }
+    const [, protocol, host, restPath] = match;
+
+    let parsedTarget;
+    try {
+      parsedTarget = new URL(`${protocol}://${host}${restPath || '/'}${url.search}`);
+    } catch {
+      return new Response('Invalid target URL', { status: 400 });
+    }
+    if (!['http:', 'https:'].includes(parsedTarget.protocol)) {
+      return new Response('Invalid protocol', { status: 400 });
+    }
+
+    const cache = caches.default;
+    const cacheKey = new Request(request.url, request);
+    if (request.method === 'GET') {
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+    }
+
+    // Forward a curated set of headers plus the real method/body, so POST
+    // forms and API calls (e.g. GraphQL) work instead of always being
+    // silently downgraded to GET against the target.
+    const forwardHeaders = new Headers();
+    for (const h of ['accept', 'accept-language', 'content-type']) {
+      const v = request.headers.get(h);
+      if (v) forwardHeaders.set(h, v);
+    }
+    forwardHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+
+    const isBodyless = ['GET', 'HEAD'].includes(request.method);
+
+    let upstream;
+    try {
+      upstream = await fetch(parsedTarget.href, {
+        method: request.method,
+        headers: forwardHeaders,
+        body: isBodyless ? undefined : request.body,
+        redirect: 'manual', // rewrite redirects ourselves to keep the browser inside the proxy
+        cf: { cacheTtl: 60, cacheEverything: false }
+      });
+    } catch (error) {
+      return new Response('Error fetching target: ' + error.message, { status: 502 });
+    }
+
+    // Rewrite redirects to stay inside the proxy instead of leaking the real URL.
+    if ([301, 302, 303, 307, 308].includes(upstream.status)) {
+      const location = upstream.headers.get('location');
+      if (location) {
+        try {
+          const real = new URL(location, parsedTarget.href);
+          return Response.redirect(url.origin + wrapReal(real, url.origin), upstream.status);
+        } catch {
+          // fall through and return the upstream response as-is
+        }
+      }
+    }
+
+    const contentType = upstream.headers.get('content-type') || '';
+
+    // Non-HTML: pass through untouched, no buffering needed.
+    if (!contentType.includes('text/html')) {
+      return upstream;
+    }
+
+    const proxyOrigin = url.origin;
+    const baseUrl = parsedTarget.href;
+
+    const rewriter = new HTMLRewriter()
+      .on('a[href]', new AttrRewriter('href', baseUrl, proxyOrigin))
+      .on('img[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('script[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('link[href]', new AttrRewriter('href', baseUrl, proxyOrigin))
+      .on('form[action]', new AttrRewriter('action', baseUrl, proxyOrigin))
+      .on('img[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
+      .on('source[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
+      .on('head', new BaseTagInjector(url.href))
+      .on('head', new ScriptInjector(proxyOrigin, parsedTarget.origin));
+
+    const transformed = rewriter.transform(upstream);
+
+    const response = new Response(transformed.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'public, max-age=60'
+      }
+    });
+
+    if (request.method === 'GET') {
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    }
+    return response;
+  }
+};
+
+// Converts a real absolute URL into our path-based proxied form.
+function wrapReal(absUrl, proxyOrigin) {
+  if (absUrl.protocol !== 'http:' && absUrl.protocol !== 'https:') return absUrl.href;
+  return `${PROXY_PATH_PREFIX}${absUrl.protocol.slice(0, -1)}/${absUrl.host}${absUrl.pathname}${absUrl.search}${absUrl.hash}`;
+}
+
+// Server-side resolution: `value` can be relative, root-relative, or
+// absolute — new URL(value, baseUrl) resolves all three correctly using the
+// real base, so (unlike client-side JS) there's no root-relative ambiguity
+// here at all.
+function toProxyPath(value, baseUrl, proxyOrigin) {
+  if (!value) return null;
+  if (/^(javascript|data|mailto|tel|#)/i.test(value)) return null;
+  try {
+    const abs = new URL(value, baseUrl);
+    return proxyOrigin + wrapReal(abs, proxyOrigin);
+  } catch {
+    return null;
+  }
+}
+
+class AttrRewriter {
+  constructor(attr, baseUrl, proxyOrigin) {
+    this.attr = attr;
+    this.baseUrl = baseUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+  element(el) {
+    const val = el.getAttribute(this.attr);
+    const newVal = toProxyPath(val, this.baseUrl, this.proxyOrigin);
+    if (newVal) el.setAttribute(this.attr, newVal);
+  }
+}
+
+class SrcsetRewriter {
+  constructor(baseUrl, proxyOrigin) {
+    this.baseUrl = baseUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+  element(el) {
+    const val = el.getAttribute('srcset');
+    if (!val) return;
+    const rewritten = val
+      .split(',')
+      .map((part) => {
+        const trimmed = part.trim();
+        const spaceIdx = trimmed.search(/\s/);
+        const u = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+        const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx).trim();
+        const proxied = toProxyPath(u, this.baseUrl, this.proxyOrigin);
+        if (!proxied) return trimmed;
+        return descriptor ? `${proxied} ${descriptor}` : proxied;
+      })
+      .join(', ');
+    el.setAttribute('srcset', rewritten);
+  }
+}
+
+// <base> makes any *relative* URL (from CSS, or from JS we didn't touch)
+// resolve against the proxied path that mirrors the real page, so plain
+// relative references keep working without any extra JS.
+class BaseTagInjector {
+  constructor(currentProxiedUrl) {
+    this.currentProxiedUrl = currentProxiedUrl;
+  }
+  element(el) {
+    el.prepend(`<base href="${this.currentProxiedUrl}">`, { html: true });
+  }
+}
+
+class ScriptInjector {
+  constructor(proxyOrigin, realOrigin) {
+    this.proxyOrigin = proxyOrigin;
+    this.realOrigin = realOrigin;
+  }
+  element(el) {
+    el.prepend(
+      `
+    <script>
+    (function() {
+      var PROXY_PREFIX = '${this.proxyOrigin}${PROXY_PATH_PREFIX}';
+      var REAL_ORIGIN = '${this.realOrigin}';
+
+      function wrapReal(u) {
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return u.href;
+        return PROXY_PREFIX + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+      }
+
+      // Handles URLs that page JS builds/uses at runtime (Turbo navigation,
+      // search suggestions, dynamic fetch/XHR) — anything not present in the
+      // original server-rendered HTML, so never passed through our
+      // server-side rewriter above.
+      function toProxied(url) {
+        try {
+          if (typeof url !== 'string') return url;
+          if (/^(data|blob|javascript):/i.test(url)) return url;
+          if (url.indexOf(PROXY_PREFIX) === 0) return url; // already proxied
+
+          // Root-relative ("/foo"): browsers resolve this against the
+          // *origin* only, ignoring the <base> directory — which would
+          // incorrectly land on our own proxy root. Resolve against the
+          // real site's origin explicitly instead.
+          if (url.charAt(0) === '/' && url.charAt(1) !== '/') {
+            return wrapReal(new URL(url, REAL_ORIGIN));
+          }
+
+          // Absolute URL (http(s)://... or protocol-relative //host/...)
+          if (/^([a-z][a-z0-9+.-]*:)?\\/\\//i.test(url)) {
+            return wrapReal(new URL(url, REAL_ORIGIN));
+          }
+
+          // Genuine relative reference: native resolution against
+          // document.baseURI (pointed at the proxied path mirroring the
+          // real page) already yields a correctly proxied absolute URL.
+          return new URL(url, document.baseURI).href;
+        } catch (e) {
+          return url;
+        }
+      }
+
+      var origFetch = window.fetch;
+      window.fetch = function(input, init) {
+        try {
+          if (typeof input === 'string') {
+            input = toProxied(input);
+          } else if (input && input.url) {
+            input = new Request(toProxied(input.url), {
+              method: input.method,
+              headers: input.headers,
+              body: ['GET', 'HEAD'].includes(input.method) ? undefined : input.body,
+              credentials: input.credentials,
+              redirect: input.redirect
+            });
+          }
+        } catch (e) {}
+        return origFetch.call(this, input, init);
+      };
+
+      var origOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        try { arguments[1] = toProxied(url); } catch (e) {}
+        return origOpen.apply(this, arguments);
+      };
+
+      // Safety net for anchors created/modified by page JS after load
+      // (never seen by the server-side rewriter).
+      document.addEventListener('click', function(e) {
+        var link = e.target.closest('a');
+        if (!link) return;
+        var raw = link.getAttribute('href');
+        if (!raw || /^(javascript|data|blob|#)/i.test(raw)) return;
+        e.preventDefault();
+        window.location.href = toProxied(raw);
+      }, true);
+    })();
+    </script>
+  `,
+      { html: true }
+    );
+  }
+}
