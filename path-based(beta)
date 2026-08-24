@@ -1,184 +1,187 @@
-// Cloudflare Workers forwarding proxy — PATH-BASED scheme
+// Cloudflare Workers forwarding proxy — path-embedded scheme.
 //
-// URL format:  https://<worker>/p/<protocol>/<host>/<path>?<query>
-//   e.g.        https://<worker>/p/https/github.com/search?q=hi
+// Target URLs are embedded directly in the proxy's path instead of a query
+// param: https://proxy.dev/https://example.com/page?x=1
+// (Old bookmarks using ?url=... still work as a fallback.)
 //
-// Why path-based instead of query-param (?url=...):
-// Browsers and JS module loaders (ES module `import`, webpack publicPath,
-// etc.) resolve relative resources against the *path* of the requesting
-// document/script — never against a query string. Putting the real
-// protocol/host/path in our own path means that resolution stays correct
-// automatically. A chunk loaded from
-//   /p/https/github.githubassets.com/assets/foo.js
-// doing `import './bar.js'` naturally resolves to
-//   /p/https/github.githubassets.com/assets/bar.js
-// which is exactly what we want. Under a query-param scheme this was
-// impossible, because the real URL was hidden inside an opaque value with
-// no directory structure to resolve against — this is what broke GitHub's
-// search/settings widgets (their JS chunks failed to load).
+// Why: putting the real URL in the *path* preserves real directory
+// structure, so the browser's native relative-URL resolution — used by ES
+// module imports, webpack/rollup chunk loading, CSS url()/@import, etc. —
+// resolves correctly on its own. None of that is reachable by rewriting
+// HTML or by JS interception, since it happens inside already-fetched JS/CSS
+// files we never parse. A query-string scheme collapses everything to the
+// proxy's root path, so any such relative reference breaks.
+//
+// Root-relative references (a raw "/api/x") still can't be fixed by path
+// structure alone — a leading "/" always resolves against the *origin*,
+// discarding any path prefix, by spec. Click/submit/fetch/XHR are handled by
+// injected JS. Direct `location.href = '/x'` or `location.assign('/x')`
+// calls made by page JS can't be — you can't intercept assignment to
+// `window.location` from a page script (redefining it throws in modern
+// browsers).
+//
+// Every request that reaches the Worker without a properly embedded target
+// is corrected server-side using the request's Referer header (see below) —
+// this is the primary fix and works immediately, on the very first request.
+// A Service Worker is also registered as a backstop for cases where a
+// Referer isn't sent (stripped by a privacy setting, etc).
 
-const PROXY_PATH_PREFIX = '/p/';
+const SW_PATH = '/__proxy_sw.js';
 
-// Service Worker: the actual root fix. Instead of trying to patch every
-// possible JS API that could initiate a request (fetch, XHR, location,
-// pushState, form submit...) - which is inherently incomplete, since any
-// library that cached an original function reference before our page
-// script ran bypasses those patches - this intercepts at the network layer.
-// Every outgoing request from the page passes through here regardless of
-// what triggered it. If a request's path is missing our /p/... prefix
-// (leaked to a bare root-relative URL by whatever mechanism), we recover
-// the real origin from the request's referrer - which, for any page this
-// proxy serves, is itself a /p/<protocol>/<host>/... URL - and redirect to
-// the corrected proxied URL before the bad request ever goes out.
-const SERVICE_WORKER_SCRIPT = `
-const PROXY_PATH_PREFIX = '/p/';
-
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
-
+const SW_SCRIPT = `
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
 
-  if (url.origin !== self.location.origin) return; // not our proxy, ignore
-  if (url.pathname === '/' || url.pathname === '/sw.js') return;
-  if (url.pathname.indexOf(PROXY_PATH_PREFIX) === 0) return; // already correct
+  // Already correctly path-embedded, or the SW script/root usage page — leave alone.
+  if (/^\\/https?:\\/\\//.test(url.pathname)) return;
+  if (url.pathname === '${SW_PATH}') return;
+  if (url.pathname === '/' && !url.search) return;
 
-  const match = (req.referrer || '').match(/\\/p\\/(https?)\\/([^/]+)/);
-  if (!match) return; // can't recover real origin, let it pass through
-
-  const [, protocol, host] = match;
-  const fixed = url.origin + PROXY_PATH_PREFIX + protocol + '/' + host + url.pathname + url.search + url.hash;
-  event.respondWith(Response.redirect(fixed, 302));
+  // A request landed at our bare origin with no embedded target — recover
+  // the real site from whichever proxied page issued it.
+  const ref = req.referrer;
+  if (!ref) return;
+  try {
+    const refUrl = new URL(ref);
+    const embedded = refUrl.pathname.slice(1);
+    const m = embedded.match(/^(https?:\\/\\/[^/]+)/);
+    if (!m) return;
+    const corrected = self.location.origin + '/' + m[1] + url.pathname + url.search;
+    event.respondWith(Response.redirect(corrected, 302));
+  } catch (e) {
+    // fall through to default handling
+  }
 });
 `;
-
-const USAGE_PAGE = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Proxy</title></head>
-<body style="font-family:sans-serif;max-width:480px;margin:60px auto">
-<h1>Proxy</h1>
-<form onsubmit="event.preventDefault(); go();">
-  <input id="u" type="url" placeholder="https://example.com" style="width:100%;padding:8px" required>
-  <button type="submit" style="margin-top:8px;padding:8px 16px">Go</button>
-</form>
-<script>
-function go() {
-  var v = document.getElementById('u').value;
-  try {
-    var u = new URL(v);
-    location.href = '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
-  } catch (e) {
-    alert('Invalid URL');
-  }
-}
-</script>
-</body></html>`;
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const proxyOrigin = url.origin;
 
-    if (url.pathname === '/sw.js') {
-      return new Response(SERVICE_WORKER_SCRIPT, {
-        headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
+    if (url.pathname === SW_PATH) {
+      return new Response(SW_SCRIPT, {
+        headers: { 'Content-Type': 'application/javascript' }
       });
     }
 
-    // Backward-compat: redirect old ?url=... bookmarks/links to the new path scheme.
-    if (url.pathname === '/' && url.searchParams.has('url')) {
+    const alreadyEmbedded = /^\/https?:\/\//i.test(url.pathname);
+
+    // Legacy ?url=... links: never served directly — always redirect to the
+    // canonical path-embedded form, so ?url= never lingers in the URL bar.
+    if (url.searchParams.has('url') && !alreadyEmbedded) {
+      let legacy = url.searchParams.get('url');
+      if (!/^https?:\/\//i.test(legacy)) legacy = 'https://' + legacy;
       try {
-        const legacy = new URL(url.searchParams.get('url'));
-        return Response.redirect(url.origin + wrapReal(legacy, url.origin), 301);
+        const canonical = proxyOrigin + '/' + new URL(legacy).href;
+        return Response.redirect(canonical, 301);
       } catch {
-        // fall through to usage page
+        return new Response('Invalid URL', { status: 400 });
       }
     }
 
-    if (url.pathname === '/') {
-      return new Response(USAGE_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    // Any other request that isn't already correctly path-embedded is a
+    // root-relative reference that escaped to the bare origin (a direct
+    // `location.href = '/x'` assignment, a request the Service Worker hasn't
+    // taken control of yet, etc). Recover the real target from the request's
+    // Referer — the browser sets this automatically to whichever proxied
+    // page issued the request — and redirect to the corrected URL rather
+    // than silently failing or mis-serving it.
+    if (!alreadyEmbedded) {
+      const ref = request.headers.get('Referer');
+      if (ref) {
+        try {
+          const refUrl = new URL(ref);
+          if (refUrl.origin === proxyOrigin) {
+            const embedded = refUrl.pathname.slice(1);
+            const m = embedded.match(/^(https?:\/\/[^/]+)/);
+            if (m) {
+              const corrected = proxyOrigin + '/' + m[1] + url.pathname + url.search;
+              return Response.redirect(corrected, 302);
+            }
+          }
+        } catch {
+          // fall through
+        }
+      }
     }
 
-    const match = url.pathname.match(/^\/p\/(https?)\/([^/]+)(\/[^?]*)?$/);
-    if (!match) {
-      return new Response('Not found. Usage: /p/https/example.com/path', { status: 404 });
+    // Path-embedded target, e.g. "/https://example.com/page" + "?x=1"
+    let targetUrl = url.pathname.slice(1) + url.search;
+
+    if (!targetUrl) {
+      return new Response('Usage: https://<this-worker>/https://example.com', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' }
+      });
     }
-    const [, protocol, host, restPath] = match;
+
+    // No scheme and no Referer to recover from — treat as a bare domain
+    // typed directly (e.g. someone navigated straight to
+    // proxy.dev/example.com with no prior proxied page).
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      targetUrl = 'https://' + targetUrl;
+    }
 
     let parsedTarget;
     try {
-      parsedTarget = new URL(`${protocol}://${host}${restPath || '/'}${url.search}`);
+      parsedTarget = new URL(targetUrl);
     } catch {
-      return new Response('Invalid target URL', { status: 400 });
+      return new Response('Invalid URL', { status: 400 });
     }
     if (!['http:', 'https:'].includes(parsedTarget.protocol)) {
       return new Response('Invalid protocol', { status: 400 });
     }
 
+    // Edge cache: identical proxied requests skip origin + rewriting entirely.
     const cache = caches.default;
     const cacheKey = new Request(request.url, request);
-    if (request.method === 'GET') {
-      const cached = await cache.match(cacheKey);
-      if (cached) return cached;
-    }
-
-    // Forward a curated set of headers plus the real method/body, so POST
-    // forms and API calls (e.g. GraphQL) work instead of always being
-    // silently downgraded to GET against the target.
-    const forwardHeaders = new Headers();
-    for (const h of ['accept', 'accept-language', 'content-type']) {
-      const v = request.headers.get(h);
-      if (v) forwardHeaders.set(h, v);
-    }
-    forwardHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-
-    const isBodyless = ['GET', 'HEAD'].includes(request.method);
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
 
     let upstream;
     try {
       upstream = await fetch(parsedTarget.href, {
-        method: request.method,
-        headers: forwardHeaders,
-        body: isBodyless ? undefined : request.body,
-        redirect: 'manual', // rewrite redirects ourselves to keep the browser inside the proxy
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
         cf: { cacheTtl: 60, cacheEverything: false }
       });
     } catch (error) {
       return new Response('Error fetching target: ' + error.message, { status: 502 });
     }
 
-    // Rewrite redirects to stay inside the proxy instead of leaking the real URL.
-    if ([301, 302, 303, 307, 308].includes(upstream.status)) {
-      const location = upstream.headers.get('location');
-      if (location) {
-        try {
-          const real = new URL(location, parsedTarget.href);
-          return Response.redirect(url.origin + wrapReal(real, url.origin), upstream.status);
-        } catch {
-          // fall through and return the upstream response as-is
-        }
-      }
-    }
-
     const contentType = upstream.headers.get('content-type') || '';
 
-    // Non-HTML: pass through untouched, no buffering needed.
+    // Non-HTML: pass through untouched, no buffering. Because the resource's
+    // own URL is now path-embedded (not query-embedded), any relative
+    // references *inside* JS/CSS files fetched this way resolve correctly
+    // via the browser's native rules — no rewriting of file contents needed.
     if (!contentType.includes('text/html')) {
       return upstream;
     }
 
-    const proxyOrigin = url.origin;
     const baseUrl = parsedTarget.href;
+    const proxiedBase = proxyOrigin + '/' + baseUrl;
 
     const rewriter = new HTMLRewriter()
       .on('a[href]', new AttrRewriter('href', baseUrl, proxyOrigin))
       .on('img[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
       .on('script[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
       .on('link[href]', new AttrRewriter('href', baseUrl, proxyOrigin))
-      .on('form[action]', new AttrRewriter('action', baseUrl, proxyOrigin))
+      .on('iframe[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('video[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('video[poster]', new AttrRewriter('poster', baseUrl, proxyOrigin))
+      .on('audio[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('source[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('embed[src]', new AttrRewriter('src', baseUrl, proxyOrigin))
+      .on('object[data]', new AttrRewriter('data', baseUrl, proxyOrigin))
+      .on('form', new FormRewriter(baseUrl))
       .on('img[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
       .on('source[srcset]', new SrcsetRewriter(baseUrl, proxyOrigin))
-      .on('head', new BaseTagInjector(url.href))
-      .on('head', new ScriptInjector(proxyOrigin, parsedTarget.origin));
+      .on('head', new BaseTagInjector(proxiedBase))
+      .on('head', new ScriptInjector(proxyOrigin));
 
     const transformed = rewriter.transform(upstream);
 
@@ -191,29 +194,21 @@ export default {
       }
     });
 
-    if (request.method === 'GET') {
-      ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    }
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   }
 };
 
-// Converts a real absolute URL into our path-based proxied form.
-function wrapReal(absUrl, proxyOrigin) {
-  if (absUrl.protocol !== 'http:' && absUrl.protocol !== 'https:') return absUrl.href;
-  return `${PROXY_PATH_PREFIX}${absUrl.protocol.slice(0, -1)}/${absUrl.host}${absUrl.pathname}${absUrl.search}${absUrl.hash}`;
+function proxify(absoluteUrl, proxyOrigin) {
+  return proxyOrigin + '/' + absoluteUrl;
 }
 
-// Server-side resolution: `value` can be relative, root-relative, or
-// absolute — new URL(value, baseUrl) resolves all three correctly using the
-// real base, so (unlike client-side JS) there's no root-relative ambiguity
-// here at all.
-function toProxyPath(value, baseUrl, proxyOrigin) {
-  if (!value) return null;
+function resolveAndProxy(value, baseUrl, proxyOrigin) {
+  if (value === null || value === undefined) return null;
   if (/^(javascript|data|mailto|tel|#)/i.test(value)) return null;
   try {
-    const abs = new URL(value, baseUrl);
-    return proxyOrigin + wrapReal(abs, proxyOrigin);
+    const abs = new URL(value, baseUrl).href;
+    return proxify(abs, proxyOrigin);
   } catch {
     return null;
   }
@@ -227,8 +222,27 @@ class AttrRewriter {
   }
   element(el) {
     const val = el.getAttribute(this.attr);
-    const newVal = toProxyPath(val, this.baseUrl, this.proxyOrigin);
+    const newVal = resolveAndProxy(val, this.baseUrl, this.proxyOrigin);
     if (newVal) el.setAttribute(this.attr, newVal);
+  }
+}
+
+// GET forms strip any existing query string from `action` on submit, so a
+// proxied action gets clobbered by the form's own fields. Instead, stash the
+// resolved real target URL and let injected JS build the request.
+class FormRewriter {
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl;
+  }
+  element(el) {
+    const actionVal = el.getAttribute('action') || '';
+    let abs;
+    try {
+      abs = new URL(actionVal, this.baseUrl).href;
+    } catch {
+      abs = this.baseUrl;
+    }
+    el.setAttribute('data-proxy-target', abs);
   }
 }
 
@@ -247,7 +261,7 @@ class SrcsetRewriter {
         const spaceIdx = trimmed.search(/\s/);
         const u = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
         const descriptor = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx).trim();
-        const proxied = toProxyPath(u, this.baseUrl, this.proxyOrigin);
+        const proxied = resolveAndProxy(u, this.baseUrl, this.proxyOrigin);
         if (!proxied) return trimmed;
         return descriptor ? `${proxied} ${descriptor}` : proxied;
       })
@@ -256,78 +270,64 @@ class SrcsetRewriter {
   }
 }
 
-// <base> makes any *relative* URL (from CSS, or from JS we didn't touch)
-// resolve against the proxied path that mirrors the real page, so plain
-// relative references keep working without any extra JS.
+// Makes directory-relative references from JS-created/dynamic content (never
+// seen by HTMLRewriter, since it only runs on the initial HTML response)
+// resolve against the *proxied* current page instead of escaping to the
+// proxy's own root.
 class BaseTagInjector {
-  constructor(currentProxiedUrl) {
-    this.currentProxiedUrl = currentProxiedUrl;
+  constructor(proxiedBase) {
+    this.proxiedBase = proxiedBase;
   }
   element(el) {
-    el.prepend(`<base href="${this.currentProxiedUrl}">`, { html: true });
+    el.prepend(`<base href="${this.proxiedBase}">`, { html: true });
   }
 }
 
 class ScriptInjector {
-  constructor(proxyOrigin, realOrigin) {
+  constructor(proxyOrigin) {
     this.proxyOrigin = proxyOrigin;
-    this.realOrigin = realOrigin;
   }
   element(el) {
     el.prepend(
       `
     <script>
     (function() {
-      var PROXY_PREFIX = '${this.proxyOrigin}${PROXY_PATH_PREFIX}';
-      var REAL_ORIGIN = '${this.realOrigin}';
-      console.log('[proxy-debug] script loaded, PROXY_PREFIX=', PROXY_PREFIX, 'REAL_ORIGIN=', REAL_ORIGIN);
+      var proxyOrigin = '${this.proxyOrigin}';
 
       if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function() {
-          console.log('[proxy-debug] service worker registered');
-        }).catch(function(e) {
-          console.warn('[proxy-debug] service worker registration failed:', e);
-        });
+        navigator.serviceWorker.register('${SW_PATH}').catch(function() {});
       }
 
-      function wrapReal(u) {
-        if (u.protocol !== 'http:' && u.protocol !== 'https:') return u.href;
-        return PROXY_PREFIX + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+      // document.baseURI is "<proxyOrigin>/<realAbsoluteUrl>" (see
+      // BaseTagInjector). Strip the proxy prefix to recover the real
+      // target's current URL, so we can resolve references (including
+      // root-relative ones the browser can't handle via <base> alone)
+      // against the REAL site, then wrap the result ourselves.
+      function realBase() {
+        var prefix = proxyOrigin + '/';
+        if (document.baseURI.indexOf(prefix) === 0) {
+          return document.baseURI.slice(prefix.length);
+        }
+        return document.baseURI;
       }
 
-      // Handles URLs that page JS builds/uses at runtime (Turbo navigation,
-      // search suggestions, dynamic fetch/XHR) — anything not present in the
-      // original server-rendered HTML, so never passed through our
-      // server-side rewriter above.
-      function toProxied(url) {
+      function toProxied(raw) {
         try {
-          if (typeof url !== 'string') return url;
-          console.log('[proxy-debug] toProxied called with:', url);
-          if (/^(data|blob|javascript):/i.test(url)) return url;
-          if (url.indexOf(PROXY_PREFIX) === 0) return url; // already proxied
-
-          // Root-relative ("/foo"): browsers resolve this against the
-          // *origin* only, ignoring the <base> directory — which would
-          // incorrectly land on our own proxy root. Resolve against the
-          // real site's origin explicitly instead.
-          if (url.charAt(0) === '/' && url.charAt(1) !== '/') {
-            return wrapReal(new URL(url, REAL_ORIGIN));
-          }
-
-          // Absolute URL (http(s)://... or protocol-relative //host/...)
-          if (/^([a-z][a-z0-9+.-]*:)?\\/\\//i.test(url)) {
-            return wrapReal(new URL(url, REAL_ORIGIN));
-          }
-
-          // Genuine relative reference: native resolution against
-          // document.baseURI (pointed at the proxied path mirroring the
-          // real page) already yields a correctly proxied absolute URL.
-          return new URL(url, document.baseURI).href;
+          if (typeof raw !== 'string' || !raw) return raw;
+          if (/^(data|blob|javascript):/i.test(raw)) return raw;
+          // Already a fully-proxied absolute URL (server-rewritten) — leave it.
+          if (raw.indexOf(proxyOrigin + '/http') === 0) return raw;
+          var abs = new URL(raw, realBase()).href;
+          return proxyOrigin + '/' + abs;
         } catch (e) {
-          return url;
+          return raw;
         }
       }
 
+      // Page JS (Turbo navigation, search suggestions, settings menus, etc.)
+      // calls fetch()/XHR with relative or root-relative URLs. Route them
+      // through the proxy - same-origin from the browser's perspective, so
+      // no CORS issue (the Worker does the real cross-origin fetch server-side).
       var origFetch = window.fetch;
       window.fetch = function(input, init) {
         try {
@@ -348,129 +348,41 @@ class ScriptInjector {
 
       var origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url) {
-        try { arguments[1] = toProxied(url); } catch (e) {}
+        try {
+          arguments[1] = toProxied(url);
+        } catch (e) {}
         return origOpen.apply(this, arguments);
       };
 
-      // Programmatic navigation (location.href = ..., location.assign(...),
-      // location.replace(...)) bypasses both the click listener and the
-      // fetch/XHR patch entirely. Window.prototype.location itself can't be
-      // redefined (browsers throw), but Location.prototype's own members
-      // are configurable, so patch those instead.
-      try {
-        var LocProto = Object.getPrototypeOf(window.location);
-        var origAssign = LocProto.assign;
-        var origReplace = LocProto.replace;
-        var hrefDesc = Object.getOwnPropertyDescriptor(LocProto, 'href');
-        console.log('[proxy-debug] location.href descriptor configurable:', hrefDesc && hrefDesc.configurable);
-
-        LocProto.assign = function(url) {
-          console.log('[proxy-debug] location.assign called with:', url);
-          return origAssign.call(this, toProxied(url));
-        };
-        LocProto.replace = function(url) {
-          console.log('[proxy-debug] location.replace called with:', url);
-          return origReplace.call(this, toProxied(url));
-        };
-        if (hrefDesc && hrefDesc.configurable && hrefDesc.set) {
-          Object.defineProperty(LocProto, 'href', {
-            get: hrefDesc.get,
-            set: function(url) {
-              console.log('[proxy-debug] location.href = ', url);
-              hrefDesc.set.call(this, toProxied(url));
-            },
-            configurable: true,
-            enumerable: hrefDesc.enumerable
-          });
-        } else {
-          console.warn('[proxy-debug] could NOT patch location.href - not configurable!');
-        }
-      } catch (e) {
-        console.warn('[proxy-debug] location patch threw:', e);
-      }
-
-      // SPA-style client-side navigation (Turbo, React Router, etc.) that
-      // updates the URL bar via the History API without a real page load.
-      ['pushState', 'replaceState'].forEach(function(method) {
-        var orig = history[method];
-        history[method] = function(state, title, url) {
-          if (url) {
-            console.log('[proxy-debug] history.' + method + ' called with:', url);
-            try { url = toProxied(url); } catch (e) {}
-          }
-          return orig.call(this, state, title, url);
-        };
-      });
-
-      // e.target gets retargeted to the shadow host for elements inside a
-      // shadow root (e.g. custom-element widgets like GitHub's search box),
-      // so e.target.tagName / .closest() silently miss the real element.
-      // composedPath() gives the true originating element regardless.
-      function firstInPath(e, selector) {
-        var path = e.composedPath ? e.composedPath() : [e.target];
-        for (var i = 0; i < path.length; i++) {
-          if (path[i] && path[i].matches && path[i].matches(selector)) return path[i];
-        }
-        return null;
-      }
-
-      // Safety net for anchors created/modified by page JS after load
-      // (never seen by the server-side rewriter).
+      // Use the RAW href attribute (not the browser-resolved .href), since a
+      // root-relative raw value resolved natively would incorrectly bind to
+      // the proxy's own origin rather than the real target's.
       document.addEventListener('click', function(e) {
-        var link = firstInPath(e, 'a');
+        var link = e.target.closest('a');
         if (!link) return;
         var raw = link.getAttribute('href');
-        if (!raw || /^(javascript|data|blob|#)/i.test(raw)) return;
+        if (!raw || /^(javascript|#|mailto|tel):/i.test(raw)) return;
+        if (raw.indexOf(proxyOrigin + '/http') === 0) return; // already proxied
         e.preventDefault();
         window.location.href = toProxied(raw);
       }, true);
 
-      // Forms created/updated by page JS (e.g. a search widget) also never
-      // pass through the server-side rewriter, so their action attribute can
-      // be a raw root-relative path. Fix it up right before submission.
-      // Note: form.submit() does NOT fire a 'submit' event at all (a
-      // spec-defined quirk), so both paths need separate handling.
-      function fixFormAction(form) {
-        try {
-          var raw = form.getAttribute('action');
-          console.log('[proxy-debug] fixFormAction, raw action=', raw);
-          if (raw) {
-            var fixed = toProxied(raw);
-            if (fixed && fixed !== raw) form.setAttribute('action', fixed);
-          }
-        } catch (e) {}
-      }
-
       document.addEventListener('submit', function(e) {
-        var form = firstInPath(e, 'form') || (e.target && e.target.tagName === 'FORM' ? e.target : null);
-        console.log('[proxy-debug] submit event, resolved form:', form);
-        if (form) fixFormAction(form);
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        var target = form.getAttribute('data-proxy-target') || form.action;
+        if (!target) return;
+        var method = (form.getAttribute('method') || 'get').toLowerCase();
+        if (method !== 'get') return; // POST left to default handling
+        e.preventDefault();
+        var urlObj = new URL(target, realBase());
+        var params = new URLSearchParams();
+        new FormData(form).forEach(function(value, key) {
+          if (typeof value === 'string') params.append(key, value);
+        });
+        urlObj.search = params.toString();
+        window.location.href = proxyOrigin + '/' + urlObj.href;
       }, true);
-
-      var origFormSubmit = HTMLFormElement.prototype.submit;
-      HTMLFormElement.prototype.submit = function() {
-        console.log('[proxy-debug] form.submit() called on:', this);
-        fixFormAction(this);
-        return origFormSubmit.call(this);
-      };
-
-      // Final safety net: every patch above tries to prevent a bad
-      // navigation before it happens, but any of them can be silently
-      // bypassed (e.g. a library that captured the original history
-      // .pushState/fetch reference before this script ran). This instead
-      // checks the OUTCOME - if we ever land on a URL missing the /p/...
-      // prefix, reconstruct and correct it immediately, regardless of what
-      // caused it.
-      function checkAndFixLocation() {
-        var path = window.location.pathname;
-        if (path === '/' || path.indexOf('${PROXY_PATH_PREFIX}') === 0) return;
-        var real = new URL(REAL_ORIGIN);
-        var fixed = PROXY_PREFIX + real.protocol.slice(0, -1) + '/' + real.host + path + window.location.search + window.location.hash;
-        console.warn('[proxy-debug] caught un-proxied navigation, correcting:', path, '->', fixed);
-        window.location.replace(fixed);
-      }
-      checkAndFixLocation();
-      window.addEventListener('popstate', checkAndFixLocation);
     })();
     </script>
   `,
