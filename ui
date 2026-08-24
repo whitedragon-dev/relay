@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #FFFFFF;
+    --surface: #F6F6F5;
+    --border: #E1E1DE;
+    --text: #131316;
+    --text-dim: #6C6C72;
+    --accent: #2547F4;
+    --accent-dim: #E9ECFE;
+    --warn: #C7431E;
+  }
+  html[data-theme="dark"] {
+    --bg: #0A0A0C;
+    --surface: #151517;
+    --border: #29292D;
+    --text: #F1F1EF;
+    --text-dim: #8B8B91;
+    --accent: #6C89FF;
+    --accent-dim: #16193A;
+    --warn: #FF8A63;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    transition: background 0.25s ease, color 0.25s ease;
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 28px 24px 60px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: clamp(48px, 12vh, 96px);
+  }
+  .mark {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+  .mark .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .theme-toggle {
+    width: 34px;
+    height: 34px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text);
+    transition: border-color 0.15s ease;
+  }
+  .theme-toggle:hover { border-color: var(--text-dim); }
+  .theme-toggle svg { width: 15px; height: 15px; }
+
+  main { flex: 1; }
+
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(36px, 7vw, 52px);
+    font-weight: 600;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    margin: 0 0 16px;
+  }
+  .sub {
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    max-width: 46ch;
+    margin: 0 0 40px;
+  }
+
+  form { margin-bottom: 56px; }
+  .field {
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    transition: border-color 0.15s ease;
+  }
+  .field:focus-within { border-color: var(--accent); }
+  .field input {
+    flex: 1;
+    border: 0;
+    background: transparent;
+    outline: none;
+    padding: 16px 4px 16px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: var(--text);
+  }
+  .field input::placeholder { color: var(--text-dim); }
+  .field button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 46px;
+    margin: 4px;
+    border: 0;
+    border-radius: 3px;
+    background: var(--accent);
+    color: var(--bg);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: opacity 0.15s ease;
+  }
+  html[data-theme="dark"] .field button { color: #0A0A0C; }
+  .field button:hover { opacity: 0.85; }
+  .field button svg { width: 17px; height: 17px; }
+  .hint {
+    margin: 10px 2px 0;
+    font-size: 13px;
+    color: var(--text-dim);
+    min-height: 18px;
+  }
+  .hint.error { color: var(--warn); }
+
+  .trace {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .trace .node { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+  .trace .node span.sq {
+    width: 9px; height: 9px;
+    border: 1px solid var(--text-dim);
+  }
+  .trace .node.active span.sq { background: var(--accent); border-color: var(--accent); }
+  .trace .line {
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+    position: relative;
+    margin: 0 -1px;
+    top: -13px;
+  }
+  .trace .line .pulse {
+    position: absolute;
+    top: -2px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: travel 3.2s linear infinite;
+  }
+  @keyframes travel {
+    0% { left: 0%; opacity: 0; }
+    8% { opacity: 1; }
+    92% { opacity: 1; }
+    100% { left: 100%; opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .trace .line .pulse { animation: none; opacity: 0.6; left: 50%; }
+  }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
+  }
+
+  @media (max-width: 460px) {
+    .trace .node span.label { display: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="mark"><span class="dot"></span>relay</div>
+      <button class="theme-toggle" id="themeToggle" aria-label="Switch theme" type="button">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <circle cx="12" cy="12" r="4.6"></circle>
+          <path d="M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7"></path>
+        </svg>
+      </button>
+    </header>
+
+    <main>
+      <p class="eyebrow">// relay</p>
+      <h1>Route any address<br>through here.</h1>
+      <p class="sub">Enter a URL. It loads through this relay, links and scripts included, without leaving the address bar.</p>
+
+      <form id="goForm" autocomplete="off">
+        <div class="field">
+          <input id="urlInput" type="text" inputmode="url" placeholder="example.com/path" spellcheck="false" autofocus>
+          <button type="submit" aria-label="Go">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+              <path d="M4 12h15M13 6l6 6-6 6"></path>
+            </svg>
+          </button>
+        </div>
+        <p class="hint" id="hint">Prefix is optional — https:// is assumed.</p>
+      </form>
+
+      <div class="trace" id="trace">
+        <div class="node active"><span class="sq"></span><span class="label">you</span></div>
+        <div class="line"><span class="pulse"></span></div>
+        <div class="node"><span class="sq"></span><span class="label">relay</span></div>
+        <div class="line"><span class="pulse" style="animation-delay: 1.6s;"></span></div>
+        <div class="node"><span class="sq"></span><span class="label">target</span></div>
+      </div>
+    </main>
+
+    <footer>
+      <span id="originLabel"></span>
+      <span>path-embedded · same-origin</span>
+    </footer>
+  </div>
+
+<script>
+(function() {
+  var root = document.documentElement;
+  var sunPath = 'M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7';
+  var moonPath = 'M20 14.6A8.4 8.4 0 1 1 9.4 4a6.7 6.7 0 0 0 10.6 10.6z';
+
+  function applyIcon(theme) {
+    var circle = document.querySelector('#themeIcon circle');
+    var path = document.querySelector('#themeIcon path');
+    if (theme === 'dark') {
+      if (circle) circle.setAttribute('r', '0');
+      path.setAttribute('d', moonPath);
+    } else {
+      if (circle) circle.setAttribute('r', '4.6');
+      path.setAttribute('d', sunPath);
+    }
+  }
+
+  var saved = null;
+  try { saved = localStorage.getItem('relay-theme'); } catch (e) {}
+  var theme = saved || 'light';
+  root.setAttribute('data-theme', theme);
+  applyIcon(theme);
+
+  document.getElementById('themeToggle').addEventListener('click', function() {
+    theme = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', theme);
+    applyIcon(theme);
+    try { localStorage.setItem('relay-theme', theme); } catch (e) {}
+  });
+
+  document.getElementById('originLabel').textContent = location.origin.replace(/^https?:\\/\\//, '');
+
+  var input = document.getElementById('urlInput');
+  var hint = document.getElementById('hint');
+  var trace = document.getElementById('trace');
+
+  function go() {
+    var val = input.value.trim();
+    if (!val) { hint.textContent = 'Enter an address first.'; hint.className = 'hint error'; return; }
+    if (!/^https?:\\/\\//i.test(val)) val = 'https://' + val;
+    try {
+      var u = new URL(val);
+      trace.classList.add('sending');
+      window.location.href = location.origin + '/' + u.href;
+    } catch (e) {
+      hint.textContent = 'That address doesn\\'t look valid.';
+      hint.className = 'hint error';
+    }
+  }
+
+  document.getElementById('goForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    go();
+  });
+
+  input.addEventListener('input', function() {
+    hint.textContent = 'Prefix is optional — https:// is assumed.';
+    hint.className = 'hint';
+  });
+})();
+</script>
+</body>
+</html>
