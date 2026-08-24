@@ -13,7 +13,7 @@ https://relay.your-worker.workers.dev/https://example.com/page?x=1
 ## Contents
 
 - `relay.js` — the Worker. Deploy this file as-is.
-- `preview.html` — a static copy of the homepage UI, for viewing without a
+- `ui.html` — a static copy of the homepage UI, for viewing without a
   deployment.
 
 ---
