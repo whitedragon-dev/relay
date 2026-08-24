@@ -5,7 +5,7 @@ load through your own domain — links, forms, scripts, and stylesheets
 included.
 
 ```
-https://relay.your-worker.workers.dev/https://example.com/page?x=1
+https://your-worker.workers.dev/https://example.com/page?x=1
 ```
 
 ---
@@ -95,7 +95,17 @@ These are handled in layers:
 
 Successfully rewritten HTML responses are cached at the edge
 (`caches.default`, 60s) keyed on the full proxied URL. The upstream fetch
-also sets `cf.cacheTtl` for a second layer of caching.
+also uses `cf.cacheTtl` (120s) for a second layer of caching at Cloudflare's
+edge.
+
+Static asset responses (JS, CSS, fonts, images) get an extended
+`Cache-Control: public, max-age=86400` applied client-side, regardless of
+what the origin sent. Proxied single-page apps re-request the same hashed
+chunks constantly while navigating; letting the browser hold onto them for
+a day removes most of that repeat traffic through the Worker. Video, audio,
+and anything not matching a static type is left untouched — range-request
+/seeking behavior and freshness-sensitive responses (API/JSON) aren't safe
+to cache this way.
 
 ---
 
@@ -138,6 +148,33 @@ browsing — links, search, forms — stays routed through the relay.
 - This is a general-purpose forwarding proxy. Anyone with the Worker's URL
   can route arbitrary traffic through it — consider adding an allow-list of
   permitted target domains and rate limiting before exposing it publicly.
+
+---
+
+## Testing checklist
+
+Deploy, then work through these in order — each targets a specific layer
+of the proxy, so a failure narrows down exactly where to look.
+
+| # | Site / action | What you're checking | Expected result |
+|---|---|---|---|
+| 1 | Open the Worker's bare URL | Homepage renders | White background by default, address field, trace line animating at the bottom. Toggle switches to dark and back; refresh — theme choice persists. |
+| 2 | Enter `wikipedia.org`, submit | Basic fetch + rewrite | Page loads, URL bar shows `/https://en.wikipedia.org/...`. Click any in-page link — navigates while staying on the proxy's domain. |
+| 3 | `news.ycombinator.com` | Plain links at scale | Every story link and comment link stays on-proxy when clicked. |
+| 4 | `duckduckgo.com`, search "test" | GET form submission | Results load with the search term intact, URL still path-embedded (not a bare `?q=test`). |
+| 5 | `github.com`, then use the search bar (magnifying glass / `/` shortcut) | JS-driven fetch, dynamic UI | Search overlay opens and returns results. This one specifically exercises the fetch/XHR patch. |
+| 6 | On GitHub, open **Settings**, then click around 2-3 nested settings pages | Client-side (Turbo) navigation | Each click updates the page without breaking out to the raw GitHub domain or landing on a bare proxy URL with no target embedded. |
+| 7 | Any site with a visible image gallery (e.g. `unsplash.com`) | `srcset`, images | Images load at appropriate resolution, no broken thumbnails. |
+| 8 | A site with an embedded YouTube/Vimeo video, or `youtube.com` directly | `iframe`/media rewriting | Embed loads and plays. |
+| 9 | Reload a page you already visited (e.g. step 2) a second time | Caching | Noticeably faster load; open DevTools → Network, confirm JS/CSS requests show `(disk cache)` or a `max-age=86400` response header. |
+| 10 | Open DevTools → Application → Service Workers | SW registered | `__proxy_sw.js` listed as activated for the Worker's origin. |
+| 11 | Try a bare `?url=https://example.com` link manually in the address bar | Legacy redirect | Immediately redirects to the clean `/https://example.com` form — `?url=` never stays in the bar. |
+| 12 | Submit an obviously broken input, e.g. `not a url` | Error handling | Homepage shows the inline "doesn't look valid" hint rather than navigating anywhere. |
+
+If something fails, note which numbered step first breaks — that maps
+directly to one of the layers in **How it works** above (rewriting,
+form handling, fetch/XHR patch, referer recovery, or the Service Worker),
+which is enough to isolate it without re-testing everything.
 
 ---
 
