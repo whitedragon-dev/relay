@@ -5,14 +5,14 @@ load through your own domain — links, forms, scripts, and stylesheets
 included.
 
 ```
-https://your-worker.workers.dev/https://example.com/page?x=1
+https://relay.your-worker.workers.dev/https://example.com/page?x=1
 ```
 
 ---
 
 ## Contents
 
-- `proxy-worker.js` — the Worker. Deploy this file as-is.
+- `relay.js` — the Worker. Deploy this file as-is.
 - `preview.html` — a static copy of the homepage UI, for viewing without a
   deployment.
 
@@ -105,7 +105,7 @@ Requires only the Cloudflare Workers free tier — no build step, no
 dependencies.
 
 ```
-wrangler deploy proxy-worker.js
+wrangler deploy relay.js
 ```
 
 or paste the file directly into the Cloudflare dashboard's Worker editor.
@@ -144,7 +144,7 @@ browsing — links, search, forms — stays routed through the relay.
 ## File map
 
 ```
-proxy-worker.js
+relay.js
 ├─ HOME_HTML            → homepage UI (light/dark, address input)
 ├─ SW_SCRIPT             → Service Worker source, served at /__proxy_sw.js
 ├─ default.fetch()       → request routing, referer recovery, rewriting
