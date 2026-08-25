@@ -25,6 +25,19 @@
 // this is the primary fix and works immediately, on the very first request.
 // A Service Worker is also registered as a backstop for cases where a
 // Referer isn't sent (stripped by a privacy setting, etc).
+//
+// Hardening notes:
+// - The real request method/body/relevant headers are forwarded upstream
+//   (previously every upstream fetch was an implicit GET, silently
+//   dropping POST bodies from proxied fetch/XHR calls).
+// - Relative URLs are resolved against upstream.url (the FINAL URL after
+//   any redirects), not the originally-requested one, so a target that
+//   redirects elsewhere doesn't break every relative link on the result.
+// - A self-referential target (proxying the relay's own origin) is refused
+//   to avoid recursive self-fetches.
+// - Known, deliberately out of scope: WebSocket upgrades aren't proxied —
+//   bridging one requires a full duplex WebSocketPair relay, which is a
+//   distinct feature rather than a hardening fix.
 
 const SW_PATH = '/__proxy_sw.js';
 
@@ -360,6 +373,11 @@ const HOME_HTML = `<!doctype html>
     if (!/^https?:\\/\\//i.test(val)) val = 'https://' + val;
     try {
       var u = new URL(val);
+      if (u.origin === location.origin) {
+        hint.textContent = "That's this relay's own address — enter the site you want to visit instead.";
+        hint.className = 'hint error';
+        return;
+      }
       trace.classList.add('sending');
       window.location.href = location.origin + '/' + u.href;
     } catch (e) {
@@ -381,6 +399,307 @@ const HOME_HTML = `<!doctype html>
 </script>
 </body>
 </html>`;
+
+// Shared error page — same design tokens, fonts, and theme toggle as
+// HOME_HTML, kept as a separate template so the working homepage is never
+// touched by changes here. status/title/message/detail/targetUrl are all
+// escaped before interpolation.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function errorPage({ status, title, message, detail, targetUrl, proxyOrigin }) {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
+  const safeDetail = detail ? escapeHtml(detail) : '';
+  const safeTarget = targetUrl ? escapeHtml(targetUrl) : '';
+  const homeUrl = escapeHtml(proxyOrigin + '/');
+
+  return `<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${status} — Relay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #FFFFFF;
+    --surface: #F6F6F5;
+    --border: #E1E1DE;
+    --text: #131316;
+    --text-dim: #6C6C72;
+    --accent: #2547F4;
+    --accent-dim: #E9ECFE;
+    --warn: #C7431E;
+  }
+  html[data-theme="dark"] {
+    --bg: #0A0A0C;
+    --surface: #151517;
+    --border: #29292D;
+    --text: #F1F1EF;
+    --text-dim: #8B8B91;
+    --accent: #6C89FF;
+    --accent-dim: #16193A;
+    --warn: #FF8A63;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    transition: background 0.25s ease, color 0.25s ease;
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 28px 24px 60px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: clamp(48px, 12vh, 96px);
+  }
+  .mark {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    text-decoration: none;
+  }
+  .mark .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+  .theme-toggle {
+    width: 34px;
+    height: 34px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text);
+    transition: border-color 0.15s ease;
+  }
+  .theme-toggle:hover { border-color: var(--text-dim); }
+  .theme-toggle svg { width: 15px; height: 15px; }
+
+  main { flex: 1; }
+
+  .code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--warn);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(30px, 6vw, 44px);
+    font-weight: 600;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin: 0 0 16px;
+  }
+  .sub {
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    max-width: 50ch;
+    margin: 0 0 8px;
+  }
+  .detail {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    max-width: 50ch;
+    margin: 0 0 32px;
+  }
+  .target {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 12px 14px;
+    margin: 0 0 32px;
+    word-break: break-all;
+  }
+  .actions {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 56px;
+  }
+  .btn {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    padding: 12px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .btn.primary {
+    background: var(--accent);
+    color: var(--bg);
+    border: 0;
+  }
+  html[data-theme="dark"] .btn.primary { color: #0A0A0C; }
+  .btn.primary:hover { opacity: 0.85; }
+  .btn.secondary {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { border-color: var(--text-dim); }
+
+  .trace {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .trace .node { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+  .trace .node span.sq { width: 9px; height: 9px; border: 1px solid var(--text-dim); }
+  .trace .node.active span.sq { background: var(--accent); border-color: var(--accent); }
+  .trace .node.broken span.sq { background: var(--warn); border-color: var(--warn); }
+  .trace .line { flex: 1; height: 1px; background: var(--border); margin: 0 -1px; top: -13px; position: relative; }
+  .trace .line.broken { background: repeating-linear-gradient(90deg, var(--warn), var(--warn) 4px, transparent 4px, transparent 8px); }
+
+  footer {
+    margin-top: auto;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="mark" href="/"><span class="dot"></span>relay</a>
+      <button class="theme-toggle" id="themeToggle" aria-label="Switch theme" type="button">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <circle cx="12" cy="12" r="4.6"></circle>
+          <path d="M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7"></path>
+        </svg>
+      </button>
+    </header>
+
+    <main>
+      <p class="code">// error ${status}</p>
+      <h1>${safeTitle}</h1>
+      <p class="sub">${safeMessage}</p>
+      ${safeDetail ? `<p class="detail">${safeDetail}</p>` : ''}
+      ${safeTarget ? `<code class="target">${safeTarget}</code>` : ''}
+
+      <div class="actions">
+        <a class="btn primary" href="${homeUrl}">Back to relay</a>
+        <button class="btn secondary" id="goBackBtn" type="button">Go back</button>
+      </div>
+
+      <div class="trace">
+        <div class="node active"><span class="sq"></span><span>you</span></div>
+        <div class="line"></div>
+        <div class="node active"><span class="sq"></span><span>relay</span></div>
+        <div class="line broken"></div>
+        <div class="node broken"><span class="sq"></span><span>target</span></div>
+      </div>
+    </main>
+
+    <footer>
+      <span id="originLabel"></span>
+      <span>status ${status}</span>
+    </footer>
+  </div>
+
+<script>
+(function() {
+  var root = document.documentElement;
+  var sunPath = 'M12 2.4v2.4M12 19.2v2.4M4.4 12H2M22 12h-2.4M5.6 5.6l1.7 1.7M16.7 16.7l1.7 1.7M5.6 18.4l1.7-1.7M16.7 7.3l1.7-1.7';
+  var moonPath = 'M20 14.6A8.4 8.4 0 1 1 9.4 4a6.7 6.7 0 0 0 10.6 10.6z';
+
+  function applyIcon(theme) {
+    var circle = document.querySelector('#themeIcon circle');
+    var path = document.querySelector('#themeIcon path');
+    if (theme === 'dark') {
+      if (circle) circle.setAttribute('r', '0');
+      path.setAttribute('d', moonPath);
+    } else {
+      if (circle) circle.setAttribute('r', '4.6');
+      path.setAttribute('d', sunPath);
+    }
+  }
+
+  var saved = null;
+  try { saved = localStorage.getItem('relay-theme'); } catch (e) {}
+  var theme = saved || 'light';
+  root.setAttribute('data-theme', theme);
+  applyIcon(theme);
+
+  document.getElementById('themeToggle').addEventListener('click', function() {
+    theme = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', theme);
+    applyIcon(theme);
+    try { localStorage.setItem('relay-theme', theme); } catch (e) {}
+  });
+
+  document.getElementById('originLabel').textContent = location.origin.replace(/^https?:\\/\\//, '');
+
+  document.getElementById('goBackBtn').addEventListener('click', function() {
+    // history.length > 1 means there's actually somewhere to go back to —
+    // if this page was the first entry in the tab (a directly pasted or
+    // bookmarked URL), history.back() would otherwise silently do nothing.
+    if (window.history.length > 1) {
+      window.history.back();
+    } else {
+      window.location.href = '${homeUrl}';
+    }
+  });
+})();
+</script>
+</body>
+</html>`;
+}
+
+function errorResponse(proxyOrigin, status, title, message, detail, targetUrl) {
+  return new Response(errorPage({ status, title, message, detail, targetUrl, proxyOrigin }), {
+    status,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -404,7 +723,7 @@ export default {
         const canonical = proxyOrigin + '/' + new URL(legacy).href;
         return Response.redirect(canonical, 301);
       } catch {
-        return new Response('Invalid URL', { status: 400 });
+        return errorResponse(proxyOrigin, 400, "That address didn't parse", "The URL passed via ?url= couldn't be read as a valid address.", null, legacy);
       }
     }
 
@@ -451,14 +770,24 @@ export default {
       targetUrl = 'https://' + targetUrl;
     }
 
+    // Defensive cap against pathological input, before even trying to parse it.
+    if (targetUrl.length > 8000) {
+      return errorResponse(proxyOrigin, 414, 'That address is too long', "The target URL exceeds what this relay will attempt to proxy.", null, targetUrl.slice(0, 200) + '…');
+    }
+
     let parsedTarget;
     try {
       parsedTarget = new URL(targetUrl);
     } catch {
-      return new Response('Invalid URL', { status: 400 });
+      return errorResponse(proxyOrigin, 400, "That address didn't parse", "The target couldn't be read as a valid URL — check it for typos.", null, targetUrl);
     }
     if (!['http:', 'https:'].includes(parsedTarget.protocol)) {
-      return new Response('Invalid protocol', { status: 400 });
+      return errorResponse(proxyOrigin, 400, 'Unsupported protocol', 'This relay only forwards http:// and https:// addresses.', null, parsedTarget.href);
+    }
+    // Refuse a self-referential target — otherwise the Worker would fetch
+    // its own origin, recursively, on a crafted or accidental link.
+    if (parsedTarget.origin === proxyOrigin) {
+      return errorResponse(proxyOrigin, 400, 'Refusing to proxy itself', "This address points back at the relay's own origin, which would cause it to fetch itself.", null, parsedTarget.href);
     }
 
     // Edge cache: identical proxied requests skip origin + rewriting entirely.
@@ -471,17 +800,41 @@ export default {
       if (cached) return cached;
     }
 
+    const upstreamInit = {
+      method: request.method,
+      headers: buildUpstreamHeaders(request, proxyOrigin),
+      redirect: 'follow',
+      // cacheEverything is safe here specifically because this proxy never
+      // forwards cookies (see README limitations) — every response is
+      // already the same generic, non-personalized view for everyone, so
+      // caching it at Cloudflare's fetch layer (not just our own edge
+      // cache below) cuts a real origin round-trip on repeat hits.
+      cf: { cacheTtl: 120, cacheEverything: true }
+    };
+    // Forward the real request body for non-GET/HEAD methods — previously
+    // every upstream fetch was an implicit GET regardless of the incoming
+    // request, silently dropping POST bodies (breaks GraphQL calls, search
+    // suggestions, and anything else proxied fetch/XHR calls send as POST).
+    if (!['GET', 'HEAD'].includes(request.method) && request.body) {
+      upstreamInit.body = request.body;
+      upstreamInit.duplex = 'half';
+    }
+
     let upstream;
     try {
-      upstream = await fetch(parsedTarget.href, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept-Encoding': 'gzip, br'
-        },
-        cf: { cacheTtl: 120, cacheEverything: false }
-      });
+      upstream = await fetchUpstream(parsedTarget.href, upstreamInit);
     } catch (error) {
-      return new Response('Error fetching target: ' + error.message, { status: 502 });
+      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", 'The request to the target failed before any response came back.', error.message, parsedTarget.href);
+    }
+
+    // Cloudflare's own edge — not the target site — returns these statuses
+    // for connectivity failures (DNS didn't resolve, origin unreachable,
+    // etc). fetch() doesn't throw for these; it resolves as a normal-looking
+    // HTML response, which would otherwise get rewritten and served as if
+    // it were the real page. Show our own explanation instead.
+    const CF_EDGE_ERROR_STATUSES = new Set([520, 521, 522, 523, 524, 525, 526, 527, 530]);
+    if (CF_EDGE_ERROR_STATUSES.has(upstream.status)) {
+      return errorResponse(proxyOrigin, 502, "Couldn't reach that address", "The target domain didn't respond — it may not exist, or is temporarily unreachable.", 'Double-check the address for typos.', parsedTarget.href);
     }
 
     const contentType = upstream.headers.get('content-type') || '';
@@ -506,7 +859,12 @@ export default {
       return upstream;
     }
 
-    const baseUrl = parsedTarget.href;
+    // upstream.url is the FINAL URL after any redirects fetch() followed
+    // server-side — using the pre-redirect parsedTarget.href here would
+    // resolve every relative link/script/etc against the wrong page
+    // whenever the target redirects (auth flows, trailing-slash/canonical
+    // redirects, moved domains).
+    const baseUrl = upstream.url || parsedTarget.href;
     const proxiedBase = proxyOrigin + '/' + baseUrl;
 
     const rewriter = new HTMLRewriter()
@@ -545,6 +903,54 @@ export default {
 
 function proxify(absoluteUrl, proxyOrigin) {
   return proxyOrigin + '/' + absoluteUrl;
+}
+
+// Selective, allowlisted header forwarding to the real origin — never the
+// full incoming header set. Host/Cookie/CF-*/etc are deliberately dropped;
+// cookies specifically are never forwarded (see README limitations).
+const FORWARD_HEADERS = ['content-type', 'accept', 'accept-language', 'authorization'];
+
+function buildUpstreamHeaders(request, proxyOrigin) {
+  const headers = new Headers();
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+  headers.set('Accept-Encoding', 'gzip, br');
+
+  for (const name of FORWARD_HEADERS) {
+    const val = request.headers.get(name);
+    if (val) headers.set(name, val);
+  }
+
+  // Best-effort same-origin Referer, recovered from our OWN incoming
+  // Referer (never fabricated). Some endpoints reject requests whose
+  // Referer doesn't match their own domain (CSRF checks on POST, etc) —
+  // without this, every such proxied request looks referrer-less to them.
+  try {
+    const clientRef = request.headers.get('Referer');
+    if (clientRef) {
+      const refUrl = new URL(clientRef);
+      if (refUrl.origin === proxyOrigin) {
+        const embedded = refUrl.pathname.slice(1);
+        if (/^https?:\/\//i.test(embedded)) headers.set('Referer', embedded);
+      }
+    }
+  } catch {
+    // best-effort only — never blocks the request
+  }
+
+  return headers;
+}
+
+// One retry on transient network failure (DNS blip, connection reset) —
+// not on HTTP error statuses, which are legitimate responses returned as-is
+// either way. Only retried when there's no body: a ReadableStream can only
+// be read once, so a request that already carries one gets a single try.
+async function fetchUpstream(url, init) {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (init.body) throw err;
+    return fetch(url, init);
+  }
 }
 
 // Content-types safe to cache aggressively client-side: static, commonly
@@ -670,6 +1076,17 @@ class ScriptInjector {
           if (/^(data|blob|javascript):/i.test(raw)) return raw;
           // Already a fully-proxied absolute URL (server-rewritten) — leave it.
           if (raw.indexOf(proxyOrigin + '/http') === 0) return raw;
+          // Some components pre-resolve a root-relative src/url against
+          // document.baseURI (our proxied <base>) before calling fetch —
+          // that drops the real target, landing on the bare proxy origin
+          // (e.g. GitHub's lazy-loaded sort/filter/"..." menus). Recover
+          // the leftover path+query and re-resolve it against the real site
+          // instead of wrapping the already-broken URL a second time.
+          if (raw.indexOf(proxyOrigin) === 0) {
+            var rest = raw.slice(proxyOrigin.length);
+            var recovered = new URL(rest, realBase()).href;
+            return proxyOrigin + '/' + recovered;
+          }
           var abs = new URL(raw, realBase()).href;
           return proxyOrigin + '/' + abs;
         } catch (e) {
