@@ -1606,14 +1606,16 @@ class ScriptInjector {
         window.location.href = toProxied(raw);
       });
 
-      document.addEventListener('submit', function(e) {
-        var form = e.target;
-        if (!form || form.tagName !== 'FORM') return;
+      // Shared by both the 'submit' event listener below (catches
+      // requestSubmit() and genuine user-triggered submissions) and the
+      // HTMLFormElement.prototype.submit() patch further down (catches
+      // direct .submit() calls, which — per spec — never fire a 'submit'
+      // event at all, so the listener alone can't see them).
+      function relaySubmitGetForm(form) {
         var target = form.getAttribute('data-proxy-target') || form.action;
-        if (!target) return;
+        if (!target) return false;
         var method = (form.getAttribute('method') || 'get').toLowerCase();
-        if (method !== 'get') return; // POST left to default handling
-        e.preventDefault();
+        if (method !== 'get') return false; // POST left to default handling
         var urlObj = new URL(target, realBase());
         var params = new URLSearchParams();
         new FormData(form).forEach(function(value, key) {
@@ -1621,7 +1623,27 @@ class ScriptInjector {
         });
         urlObj.search = params.toString();
         window.location.href = proxyOrigin + '/' + urlObj.href;
+        return true;
+      }
+
+      document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        if (relaySubmitGetForm(form)) e.preventDefault();
       }, true);
+
+      // form.submit() bypasses the 'submit' event entirely (a documented
+      // DOM quirk) — a <textarea>-based search box (which doesn't submit
+      // on Enter natively, unlike a single-line <input>) commonly has its
+      // own JS call this directly to make Enter work, which is invisible
+      // to the listener above no matter what it does.
+      var origFormSubmit = HTMLFormElement.prototype.submit;
+      HTMLFormElement.prototype.submit = function() {
+        try {
+          if (relaySubmitGetForm(this)) return;
+        } catch (e) {}
+        return origFormSubmit.call(this);
+      };
     })();
     </script>
   `,
