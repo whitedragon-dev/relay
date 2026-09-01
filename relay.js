@@ -35,26 +35,13 @@
 //   redirects elsewhere doesn't break every relative link on the result.
 // - A self-referential target (proxying the relay's own origin) is refused
 //   to avoid recursive self-fetches.
-// - WebSocket connections are bridged (see handleWebSocketUpgrade and the
-//   client-side WebSocket override below) — browser <-> Worker <-> real
-//   target, including converting the handshake's Origin header to the real
-//   target's own origin, since many WS servers reject a mismatched one.
+// - Known, deliberately out of scope: WebSocket upgrades aren't proxied —
+//   bridging one requires a full duplex WebSocketPair relay, which is a
+//   distinct feature rather than a hardening fix.
 
 const SW_PATH = '/__proxy_sw.js';
 
 const SW_SCRIPT = `
-// Without these, a newly-deployed version of this script doesn't take over
-// an already-open tab until every tab using the OLD version is closed —
-// standard SW lifecycle behavior, but it means a redeploy can silently
-// leave a browser running stale logic indefinitely, causing confusing
-// behavior that only a hard reload (forcing a fresh update check) fixes.
-self.addEventListener('install', (event) => {
-  event.waitUntil(self.skipWaiting());
-});
-self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
-});
-
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
@@ -714,109 +701,10 @@ function errorResponse(proxyOrigin, status, title, message, detail, targetUrl) {
   });
 }
 
-// WebSocket bridging: browser <-> this Worker <-> the real target.
-// The client-side WebSocket constructor override (in ScriptInjector) routes
-// ws(s) connections through this same path-embedded scheme (e.g.
-// /wss://real.com/socket); this is the server-side half that completes the
-// handshake on both ends and relays messages/close/error between them.
-//
-// Cloudflare Workers negotiate an OUTBOUND WebSocket via a plain http(s)
-// fetch() with an Upgrade header set — not a literal wss:// URL — and the
-// far end is then exposed as `response.webSocket`.
-async function handleWebSocketUpgrade(request, url, proxyOrigin) {
-  const targetUrl = url.pathname.slice(1) + url.search;
-  if (!/^wss?:\/\//i.test(targetUrl)) {
-    return new Response('Invalid WebSocket target', { status: 400 });
-  }
-
-  let parsedTarget;
-  try {
-    parsedTarget = new URL(targetUrl);
-  } catch {
-    return new Response('Invalid WebSocket target', { status: 400 });
-  }
-  if (parsedTarget.origin.replace(/^wss?/, 'https') === proxyOrigin) {
-    return new Response('Refusing to proxy the relay itself', { status: 400 });
-  }
-
-  const httpEquivalent = parsedTarget.href.replace(/^ws/, 'http');
-  const realOrigin = parsedTarget.origin.replace(/^ws/, 'http');
-
-  const upstreamHeaders = new Headers({
-    'Upgrade': 'websocket',
-    'Connection': 'Upgrade',
-    // Real target origin, not our proxy's — many WebSocket servers reject
-    // the handshake outright if Origin doesn't match their own site.
-    'Origin': realOrigin,
-    // Real browser UA, not a fixed spoofed one — see buildUpstreamHeaders.
-    'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-  });
-  // Forward subprotocol negotiation. The browser's WebSocket constructor
-  // sends its offered protocols in this header; it must eventually see
-  // back whichever one the real server actually chose (below), or
-  // socket.protocol is empty and strict clients reject the connection.
-  const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
-  if (requestedProtocol) upstreamHeaders.set('Sec-WebSocket-Protocol', requestedProtocol);
-
-  let upstream;
-  try {
-    // 10s is generous for a handshake specifically (not the connection's
-    // lifetime — once upstream.webSocket exists below, it's independent of
-    // this timeout) while still failing fast on an unreachable game server
-    // rather than leaving the connecting UI hanging indefinitely.
-    upstream = await fetchUpstream(httpEquivalent, { headers: upstreamHeaders }, 10000);
-  } catch (err) {
-    return new Response('WebSocket upstream connection failed: ' + err.message, { status: 502 });
-  }
-
-  const upstreamSocket = upstream.webSocket;
-  if (!upstreamSocket) {
-    return new Response('Target did not upgrade to WebSocket', { status: 502 });
-  }
-
-  let client, server;
-  try {
-    upstreamSocket.accept();
-    [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-  } catch (err) {
-    try { upstreamSocket.close(); } catch {}
-    return new Response('WebSocket bridge setup failed: ' + err.message, { status: 502 });
-  }
-
-  server.addEventListener('message', (e) => {
-    try { upstreamSocket.send(e.data); } catch {}
-  });
-  upstreamSocket.addEventListener('message', (e) => {
-    try { server.send(e.data); } catch {}
-  });
-  server.addEventListener('close', (e) => {
-    try { upstreamSocket.close(e.code, e.reason); } catch {}
-  });
-  upstreamSocket.addEventListener('close', (e) => {
-    try { server.close(e.code, e.reason); } catch {}
-  });
-  server.addEventListener('error', () => { try { upstreamSocket.close(); } catch {} });
-  upstreamSocket.addEventListener('error', () => { try { server.close(); } catch {} });
-
-  // Echo back whichever subprotocol the REAL server actually accepted —
-  // not simply the client's request verbatim.
-  const acceptedProtocol = upstream.headers.get('Sec-WebSocket-Protocol');
-  const responseInit = { status: 101, webSocket: client };
-  if (acceptedProtocol) {
-    responseInit.headers = { 'Sec-WebSocket-Protocol': acceptedProtocol };
-  }
-  return new Response(null, responseInit);
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const proxyOrigin = url.origin;
-
-    if (request.headers.get('Upgrade') === 'websocket') {
-      return handleWebSocketUpgrade(request, url, proxyOrigin);
-    }
 
     if (url.pathname === SW_PATH) {
       return new Response(SW_SCRIPT, {
@@ -914,7 +802,7 @@ export default {
 
     const upstreamInit = {
       method: request.method,
-      headers: buildUpstreamHeaders(request, proxyOrigin, parsedTarget.origin),
+      headers: buildUpstreamHeaders(request, proxyOrigin),
       redirect: 'follow',
       // cacheEverything is safe here specifically because this proxy never
       // forwards cookies (see README limitations) — every response is
@@ -965,14 +853,7 @@ export default {
           statusText: upstream.statusText,
           headers
         });
-        // .clone() tees the stream, roughly doubling in-flight buffering —
-        // fine for a typical script/image, wasteful and riskier for a large
-        // game/WASM bundle (these commonly run 50-200MB+). Skip our OWN
-        // edge-cache write above the threshold; the browser still benefits
-        // from the Cache-Control header above either way.
-        const lengthHeader = upstream.headers.get('content-length');
-        const tooLargeToCache = lengthHeader && parseInt(lengthHeader, 10) > ASSET_CACHE_SIZE_LIMIT;
-        if (cacheable && !tooLargeToCache) ctx.waitUntil(cache.put(cacheKey, asset.clone()));
+        if (cacheable) ctx.waitUntil(cache.put(cacheKey, asset.clone()));
         return asset;
       }
       return upstream;
@@ -1024,139 +905,52 @@ function proxify(absoluteUrl, proxyOrigin) {
   return proxyOrigin + '/' + absoluteUrl;
 }
 
-// Headers we set ourselves, that leak the proxy's own domain if forwarded
-// verbatim, or that are hop-by-hop/infra-only and meaningless upstream.
-// Everything else the page/browser actually sent is forwarded as-is — an
-// allowlist here would always be one custom header behind real-world sites
-// (anti-abuse tokens, API versioning headers, CSRF tokens, etc); a denylist
-// is far more robust. Cookies specifically are never forwarded (see README
-// limitations).
-const DROP_HEADERS = new Set([
-  'host', 'cookie', 'content-length', 'connection',
-  'user-agent',
-  'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker',
-  'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-  'referer', 'origin' // handled specially below, not silently forwarded raw
-]);
+// Selective, allowlisted header forwarding to the real origin — never the
+// full incoming header set. Host/Cookie/CF-*/etc are deliberately dropped;
+// cookies specifically are never forwarded (see README limitations).
+const FORWARD_HEADERS = ['content-type', 'accept', 'accept-language', 'authorization'];
 
-// Recovers the real target URL embedded in a proxy-origin header value
-// (e.g. a Referer/Origin the browser set to our own domain), or null if the
-// value isn't one of ours.
-function recoverRealUrl(headerValue, proxyOrigin) {
-  if (!headerValue) return null;
-  try {
-    const u = new URL(headerValue);
-    if (u.origin !== proxyOrigin) return null;
-    const embedded = u.pathname.slice(1);
-    return /^https?:\/\//i.test(embedded) ? embedded : null;
-  } catch {
-    return null;
-  }
-}
-
-function buildUpstreamHeaders(request, proxyOrigin, targetOrigin) {
+function buildUpstreamHeaders(request, proxyOrigin) {
   const headers = new Headers();
-  // Forward the REAL browser's own User-Agent rather than a fixed spoofed
-  // string. This request's Sec-Ch-Ua/Sec-Fetch-* headers (forwarded below,
-  // since they're not in DROP_HEADERS) already reflect the real browser —
-  // a substituted User-Agent that doesn't match them is an internal
-  // inconsistency that bot-detection systems specifically look for. Only
-  // fall back to a generic default if the client somehow sent none at all.
-  const realUA = request.headers.get('User-Agent');
-  headers.set('User-Agent', realUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-  // Accept-Encoding is NOT set here — the real browser's own value is
-  // forwarded via the denylist loop below, for the same reason as
-  // User-Agent above: a substituted value that doesn't match what a real
-  // browser of that claimed identity would actually send is a detectable
-  // inconsistency.
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+  headers.set('Accept-Encoding', 'gzip, br');
 
-  for (const [name, value] of request.headers) {
-    if (DROP_HEADERS.has(name.toLowerCase())) continue;
-    headers.set(name, value);
+  for (const name of FORWARD_HEADERS) {
+    const val = request.headers.get(name);
+    if (val) headers.set(name, val);
   }
 
-  // Referer carries a full path, so the real target can be recovered from
-  // its content. Origin never carries a path (just scheme+host) — there's
-  // nothing to recover from it, so when the browser sent one at all, set it
-  // to the request's own known real target origin instead.
-  const realReferer = recoverRealUrl(request.headers.get('Referer'), proxyOrigin);
-  if (realReferer) headers.set('Referer', realReferer);
-
-  if (request.headers.get('Origin')) {
-    headers.set('Origin', targetOrigin);
+  // Best-effort same-origin Referer, recovered from our OWN incoming
+  // Referer (never fabricated). Some endpoints reject requests whose
+  // Referer doesn't match their own domain (CSRF checks on POST, etc) —
+  // without this, every such proxied request looks referrer-less to them.
+  try {
+    const clientRef = request.headers.get('Referer');
+    if (clientRef) {
+      const refUrl = new URL(clientRef);
+      if (refUrl.origin === proxyOrigin) {
+        const embedded = refUrl.pathname.slice(1);
+        if (/^https?:\/\//i.test(embedded)) headers.set('Referer', embedded);
+      }
+    }
+  } catch {
+    // best-effort only — never blocks the request
   }
 
   return headers;
-}
-
-// Above this, skip our own edge-cache write for a static asset (still gets
-// browser-side Cache-Control either way) — see the asset-caching branch.
-const ASSET_CACHE_SIZE_LIMIT = 20 * 1024 * 1024; // 20MB
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Parses Retry-After as either delta-seconds or an HTTP-date, per spec.
-// Returns null when absent or unparseable.
-function parseRetryAfterMs(header) {
-  if (!header) return null;
-  const asInt = parseInt(header, 10);
-  if (!Number.isNaN(asInt) && String(asInt) === header.trim()) return asInt * 1000;
-  const asDate = Date.parse(header);
-  if (!Number.isNaN(asDate)) return Math.max(0, asDate - Date.now());
-  return null;
-}
-
-// Fails fast on a hung/stalled upstream rather than letting the request run
-// indefinitely — bounded so a single slow connection can't quietly eat the
-// Worker's whole execution budget. Only wraps the request itself; once a
-// WebSocket handshake completes, the resulting socket lives independently
-// of this signal and is unaffected by it.
-async function fetchWithTimeout(url, init, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs || 20000);
-  try {
-    return await fetch(url, Object.assign({}, init, { signal: controller.signal }));
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 // One retry on transient network failure (DNS blip, connection reset) —
 // not on HTTP error statuses, which are legitimate responses returned as-is
 // either way. Only retried when there's no body: a ReadableStream can only
 // be read once, so a request that already carries one gets a single try.
-//
-// Also adds a short, capped retry specifically for throttling responses
-// (429/503) that include a short Retry-After — relevant for game traffic
-// especially, since many concurrent relay users hitting the same game
-// server can all appear to originate from Cloudflare's own IP ranges,
-// making a real rate limit more likely to be hit than for ordinary
-// browsing. Capped at 2s and one attempt so a single request can never
-// stall for long chasing a throttle that isn't going to clear soon.
-async function fetchUpstream(url, init, timeoutMs) {
-  let response;
+async function fetchUpstream(url, init) {
   try {
-    response = await fetchWithTimeout(url, init, timeoutMs);
+    return await fetch(url, init);
   } catch (err) {
     if (init.body) throw err;
-    response = await fetchWithTimeout(url, init, timeoutMs);
+    return fetch(url, init);
   }
-
-  if ((response.status === 429 || response.status === 503) && !init.body) {
-    const waitMs = parseRetryAfterMs(response.headers.get('Retry-After'));
-    if (waitMs !== null && waitMs <= 2000) {
-      await sleep(waitMs);
-      try {
-        response = await fetchWithTimeout(url, init, timeoutMs);
-      } catch {
-        // keep the original throttled response if the retry itself fails
-      }
-    }
-  }
-
-  return response;
 }
 
 // Content-types safe to cache aggressively client-side: static, commonly
@@ -1261,25 +1055,7 @@ class ScriptInjector {
 
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('${SW_PATH}').catch(function() {});
-
-        // Block the TARGET site's own Service Worker registration attempts.
-        // A foreign site's SW can't function correctly under our proxied
-        // URL scheme (its internal relative references assume the real
-        // site's own paths), and if it takes over fetch handling on this
-        // origin, its requests start failing — which is exactly the
-        // trigger many sites use to show a "you're offline" fallback UI.
-        navigator.serviceWorker.register = function() {
-          return Promise.reject(new Error('Service Worker registration disabled by relay'));
-        };
       }
-
-      // Some sites gate an offline UI directly off navigator.onLine rather
-      // than (or in addition to) a failed request — force it true so a
-      // real network failure elsewhere doesn't get misread as "offline"
-      // when the actual browser connection is fine.
-      try {
-        Object.defineProperty(navigator, 'onLine', { value: true, configurable: true });
-      } catch (e) {}
 
       // document.baseURI is "<proxyOrigin>/<realAbsoluteUrl>" (see
       // BaseTagInjector). Strip the proxy prefix to recover the real
@@ -1318,92 +1094,12 @@ class ScriptInjector {
         }
       }
 
-      // --- Diagnostic overlay -------------------------------------------
-      // Shows failed (non-2xx, network-error, or failed-to-load-resource)
-      // requests in a small on-page panel — method, real target URL,
-      // status — so a failure is visible and copyable as plain text
-      // without opening DevTools or taking a screenshot. Purely
-      // observational: never alters a request or its result, only logs
-      // after the fact.
-      var __relayFailures = [];
-      var MAX_LOGGED = 15;
-
-      function relayEnsurePanel() {
-        if (document.getElementById('__relay_debug_panel')) return;
-        var panel = document.createElement('div');
-        panel.id = '__relay_debug_panel';
-        panel.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:2147483647;' +
-          'background:#111;border:1px solid #333;border-radius:6px;width:340px;max-height:280px;' +
-          'overflow:auto;display:none;box-shadow:0 4px 16px rgba(0,0,0,.4);' +
-          'font-family:ui-monospace,monospace;font-size:11px;';
-        panel.innerHTML =
-          '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;' +
-          'padding:6px 8px;background:#1a1a1a;border-bottom:1px solid #333;">' +
-          '<span style="color:#ccc;">relay \u2014 failed requests</span>' +
-          '<span style="display:flex;gap:10px;align-items:center;">' +
-          '<button id="__relay_debug_copy" style="background:none;border:1px solid #444;' +
-          'color:#ccc;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px;">Copy</button>' +
-          '<button id="__relay_debug_close" style="background:none;border:0;color:#888;' +
-          'cursor:pointer;font-size:14px;line-height:1;">\u00d7</button></span></div>' +
-          '<div id="__relay_debug_list"></div>';
-        (document.body || document.documentElement).appendChild(panel);
-        document.getElementById('__relay_debug_close').addEventListener('click', function() {
-          panel.style.display = 'none';
-        });
-        document.getElementById('__relay_debug_copy').addEventListener('click', function() {
-          var btn = document.getElementById('__relay_debug_copy');
-          var text = __relayFailures.map(function(r) {
-            return r.status + ' ' + r.method + ' ' + r.url + (r.note ? ' - ' + r.note : '');
-          }).join('\n');
-          function done(ok) { btn.textContent = ok ? 'Copied!' : 'Copy failed'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500); }
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(function() { done(true); }, function() { done(false); });
-          } else {
-            done(false);
-          }
-        });
-      }
-
-      function relayLogFailure(method, realUrl, status, note) {
-        try {
-          relayEnsurePanel();
-          __relayFailures.unshift({ method: method, url: realUrl, status: status, note: note || '' });
-          if (__relayFailures.length > MAX_LOGGED) __relayFailures.pop();
-          var panel = document.getElementById('__relay_debug_panel');
-          var list = document.getElementById('__relay_debug_list');
-          if (!panel || !list) return;
-          panel.style.display = 'block';
-          list.innerHTML = __relayFailures.map(function(r) {
-            return '<div style="padding:6px 8px;border-bottom:1px solid #262626;color:#eee;' +
-              'word-break:break-all;"><b style="color:#ff8a63;">' + r.status + '</b> ' +
-              r.method + ' ' + r.url + (r.note ? ' \u2014 ' + r.note : '') + '</div>';
-          }).join('');
-        } catch (e) {}
-      }
-
-      // Resource load failures (a missing texture, a font, a game engine's
-      // own script 404ing) don't fire on fetch/XHR/WebSocket at all, and
-      // these error events don't bubble — a capture-phase listener on
-      // window is the only way to observe them globally. Previously
-      // invisible to this panel entirely, despite being a very common
-      // reason a page (or game) fails to render correctly.
-      window.addEventListener('error', function(e) {
-        var el = e.target;
-        if (!el || !el.tagName) return;
-        var tag = el.tagName.toUpperCase();
-        if (['IMG', 'SCRIPT', 'LINK', 'AUDIO', 'VIDEO', 'SOURCE', 'IFRAME'].indexOf(tag) === -1) return;
-        var src = el.src || el.href || '?';
-        relayLogFailure(tag, src, 'LOAD_ERR', 'failed to load');
-      }, true);
-      // ---------------------------------------------------------------
-
+      // Page JS (Turbo navigation, search suggestions, settings menus, etc.)
       // calls fetch()/XHR with relative or root-relative URLs. Route them
       // through the proxy - same-origin from the browser's perspective, so
       // no CORS issue (the Worker does the real cross-origin fetch server-side).
       var origFetch = window.fetch;
       window.fetch = function(input, init) {
-        var method = (init && init.method) || (input && input.method) || 'GET';
-        var originalForLog = typeof input === 'string' ? input : (input && input.url) || '';
         try {
           if (typeof input === 'string') {
             input = toProxied(input);
@@ -1417,133 +1113,16 @@ class ScriptInjector {
             });
           }
         } catch (e) {}
-        return origFetch.call(this, input, init).then(function(res) {
-          if (!res.ok) relayLogFailure(method, originalForLog, res.status);
-          return res;
-        }, function(err) {
-          relayLogFailure(method, originalForLog, 'ERR', err && err.message);
-          throw err;
-        });
+        return origFetch.call(this, input, init);
       };
 
       var origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url) {
-        this.__relayMethod = method;
-        this.__relayUrl = url;
         try {
           arguments[1] = toProxied(url);
         } catch (e) {}
         return origOpen.apply(this, arguments);
       };
-
-      var origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.send = function() {
-        var xhr = this;
-        xhr.addEventListener('loadend', function() {
-          if (xhr.status === 0 || xhr.status >= 400) {
-            relayLogFailure(xhr.__relayMethod || '?', xhr.__relayUrl || '?', xhr.status || 'ERR');
-          }
-        });
-        return origSend.apply(this, arguments);
-      };
-
-      // Search results (Bing, Google, etc.) very commonly open a result via
-      // a JS window.open(url, '_blank') call rather than a plain link — a
-      // separate API from fetch/XHR/click, previously unpatched entirely.
-      // Rewrite the URL before it reaches the real window.open, same as
-      // every other patched API above.
-      if (typeof window.open === 'function') {
-        var origWindowOpen = window.open;
-        window.open = function(url, target, features) {
-          var proxied;
-          try {
-            proxied = (url && !/^about:/i.test(url)) ? toProxied(String(url)) : url;
-          } catch (e) {
-            proxied = url;
-          }
-          return origWindowOpen.call(window, proxied, target, features);
-        };
-      }
-
-      // EventSource (Server-Sent Events) is a distinct API from fetch/XHR —
-      // many streaming chat/AI apps use it to deliver responses token by
-      // token. Unpatched, a relative or cross-origin EventSource URL either
-      // resolves against the wrong origin or hits a real CORS wall, and the
-      // stream never opens — which can look like "nothing happens" on the
-      // page (a message that never sends or never gets a reply).
-      if (typeof window.EventSource === 'function') {
-        var OrigEventSource = window.EventSource;
-        var PatchedEventSource = function(url, opts) {
-          return new OrigEventSource(toProxied(url), opts);
-        };
-        PatchedEventSource.prototype = OrigEventSource.prototype;
-        PatchedEventSource.CONNECTING = OrigEventSource.CONNECTING;
-        PatchedEventSource.OPEN = OrigEventSource.OPEN;
-        PatchedEventSource.CLOSED = OrigEventSource.CLOSED;
-        window.EventSource = PatchedEventSource;
-      }
-
-      // WebSocket is a separate global, untouched by the fetch/XHR patches
-      // above. Unpatched, a page connecting to wss://real-site.com/socket
-      // would either bypass the proxy entirely, or get rejected by the
-      // target's own Origin check (the handshake's Origin header reflects
-      // THIS page's origin — our proxy's — not the real site's). Route it
-      // through the same path-embedded scheme instead.
-      if (typeof window.WebSocket === 'function') {
-        var OrigWebSocket = window.WebSocket;
-        var proxyWsOrigin = proxyOrigin.replace(/^http/, 'ws');
-
-        // Reuses toProxied()'s relative-URL resolution AND its
-        // self-referential-origin recovery, by converting ws(s) <-> http(s)
-        // around it, rather than duplicating that logic separately. Without
-        // the recovery step, a page building its WS url from its own
-        // location.origin — which, under this proxy, IS our own origin, a
-        // common "connect to same-host websocket" pattern — produces a
-        // self-referential URL the server has to refuse outright, which is
-        // exactly what caused an endless connect/retry loop.
-        function toProxiedWs(raw) {
-          var httpForm = String(raw).replace(/^ws/, 'http');
-          var proxiedHttp = toProxied(httpForm);
-          var prefix = proxyOrigin + '/';
-          if (proxiedHttp.indexOf(prefix) === 0) {
-            return proxyWsOrigin + '/' + proxiedHttp.slice(prefix.length).replace(/^http/, 'ws');
-          }
-          return proxiedHttp.replace(/^http/, 'ws');
-        }
-
-        var PatchedWebSocket = function(url, protocols) {
-          var proxied, realTarget;
-          try {
-            proxied = toProxiedWs(url);
-            var wsPrefix = proxyWsOrigin + '/';
-            realTarget = proxied.indexOf(wsPrefix) === 0 ? proxied.slice(wsPrefix.length) : proxied;
-          } catch (e) {
-            proxied = url;
-            realTarget = url;
-          }
-          var sock = protocols !== undefined
-            ? new OrigWebSocket(proxied, protocols)
-            : new OrigWebSocket(proxied);
-          sock.addEventListener('error', function() {
-            relayLogFailure('WS', realTarget, 'ERR', 'connection failed');
-          });
-          sock.addEventListener('close', function(e) {
-            // 1000/1005 are normal closure codes — anything else is worth
-            // surfacing (e.g. the Worker rejected the upgrade, or the real
-            // target refused the handshake).
-            if (e.code !== 1000 && e.code !== 1005) {
-              relayLogFailure('WS', realTarget, e.code, e.reason || 'closed unexpectedly');
-            }
-          });
-          return sock;
-        };
-        PatchedWebSocket.prototype = OrigWebSocket.prototype;
-        PatchedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
-        PatchedWebSocket.OPEN = OrigWebSocket.OPEN;
-        PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING;
-        PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED;
-        window.WebSocket = PatchedWebSocket;
-      }
 
       // Use the RAW href attribute (not the browser-resolved .href), since a
       // root-relative raw value resolved natively would incorrectly bind to
@@ -1554,47 +1133,6 @@ class ScriptInjector {
       // controls — dropdown/menu triggers, tabs — in an <a> for styling and
       // handle the click themselves; capturing first stole those clicks and
       // forced a full reload instead of letting the page open its menu.
-      // SPA client-side routing (history.pushState/replaceState) changes the
-      // address bar directly, with no network request at all — none of the
-      // fetch/XHR/WebSocket interceptors above can see this. A page's own
-      // pushState('/results?q=hi') resolves against the CURRENT address
-      // (our proxy), landing on the bare proxy origin with no embedded
-      // target at all — this is what produced a URL like
-      // "proxy.../results?search_query=hi" with youtube.com missing.
-      function relayUpdateBaseTag(proxiedUrl) {
-        try {
-          var prefix = proxyOrigin + '/';
-          if (proxiedUrl.indexOf(prefix + 'http') !== 0) return;
-          var baseEl = document.querySelector('base');
-          if (baseEl) baseEl.setAttribute('href', proxiedUrl);
-        } catch (e) {}
-      }
-
-      var origPushState = history.pushState;
-      var origReplaceState = history.replaceState;
-
-      history.pushState = function(state, title, url) {
-        if (url !== undefined && url !== null) {
-          url = toProxied(String(url));
-          relayUpdateBaseTag(url);
-        }
-        return origPushState.call(this, state, title, url);
-      };
-
-      history.replaceState = function(state, title, url) {
-        if (url !== undefined && url !== null) {
-          url = toProxied(String(url));
-          relayUpdateBaseTag(url);
-        }
-        return origReplaceState.call(this, state, title, url);
-      };
-
-      // Back/forward navigation between pushState entries restores the URL
-      // without a network request either — keep <base> in sync there too.
-      window.addEventListener('popstate', function() {
-        relayUpdateBaseTag(location.href);
-      });
-
       document.addEventListener('click', function(e) {
         if (e.defaultPrevented) return;
         var link = e.target.closest('a');
@@ -1606,16 +1144,14 @@ class ScriptInjector {
         window.location.href = toProxied(raw);
       });
 
-      // Shared by both the 'submit' event listener below (catches
-      // requestSubmit() and genuine user-triggered submissions) and the
-      // HTMLFormElement.prototype.submit() patch further down (catches
-      // direct .submit() calls, which — per spec — never fire a 'submit'
-      // event at all, so the listener alone can't see them).
-      function relaySubmitGetForm(form) {
+      document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
         var target = form.getAttribute('data-proxy-target') || form.action;
-        if (!target) return false;
+        if (!target) return;
         var method = (form.getAttribute('method') || 'get').toLowerCase();
-        if (method !== 'get') return false; // POST left to default handling
+        if (method !== 'get') return; // POST left to default handling
+        e.preventDefault();
         var urlObj = new URL(target, realBase());
         var params = new URLSearchParams();
         new FormData(form).forEach(function(value, key) {
@@ -1623,27 +1159,7 @@ class ScriptInjector {
         });
         urlObj.search = params.toString();
         window.location.href = proxyOrigin + '/' + urlObj.href;
-        return true;
-      }
-
-      document.addEventListener('submit', function(e) {
-        var form = e.target;
-        if (!form || form.tagName !== 'FORM') return;
-        if (relaySubmitGetForm(form)) e.preventDefault();
       }, true);
-
-      // form.submit() bypasses the 'submit' event entirely (a documented
-      // DOM quirk) — a <textarea>-based search box (which doesn't submit
-      // on Enter natively, unlike a single-line <input>) commonly has its
-      // own JS call this directly to make Enter work, which is invisible
-      // to the listener above no matter what it does.
-      var origFormSubmit = HTMLFormElement.prototype.submit;
-      HTMLFormElement.prototype.submit = function() {
-        try {
-          if (relaySubmitGetForm(this)) return;
-        } catch (e) {}
-        return origFormSubmit.call(this);
-      };
     })();
     </script>
   `,
